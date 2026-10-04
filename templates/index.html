@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQL Visualizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">SQL LEARNING PLATFORM</div>
+      <h1>SQL Visualizer</h1>
+      <p>Analyze, visualize, run and understand SQL.</p>
+    </div>
+    <div class="account-area">
+      <div class="account-chip"><span class="account-label">Signed in as</span><strong>{{ user.email }}</strong></div>
+      {% if is_admin %}<a class="logout-link" href="/admin">Admin DB</a>{% endif %}
+      <a class="logout-link" href="/logout">Log out</a>
+      <div class="status" id="status">Ready</div>
+    </div>
+  </header>
+
+  <main>
+    <section class="editor-card card">
+      <div class="section-heading">
+        <div>
+          <h2>SQL Editor</h2>
+          <span>Analyze one SELECT/WITH query at a time against your personal read-only sandbox.</span>
+        </div>
+        <div class="actions">
+          <button id="analyzeButton" onclick="runAnalysis()">Analyze Query</button>
+          <button class="secondary" onclick="loadHistory()">Refresh History</button>
+        </div>
+      </div>
+      <textarea id="query" spellcheck="false" placeholder="SELECT users.id, users.name FROM users JOIN orders ON users.id = orders.user_id WHERE users.id = 1;"></textarea>
+      <div class="editor-note"><span>Personal sandbox</span><span>Sample tables: users · orders · products · order_items · departments</span></div>
+    </section>
+
+    <nav class="tabs" aria-label="Application sections">
+      <button class="tab active" data-tab="er">ER Diagram</button>
+      <button class="tab" data-tab="analysis">Analysis</button>
+      <button class="tab" data-tab="performance">Performance</button>
+      <button class="tab" data-tab="security">Security</button>
+      <button class="tab" data-tab="output">Output</button>
+      <button class="tab" data-tab="ai">AI Tutor</button>
+      <button class="tab" data-tab="database">Database</button>
+      <button class="tab" data-tab="history">History</button>
+    </nav>
+
+    <section class="tab-panel active" id="tab-er">
+      <div class="panel-toolbar">
+        <div><h2>Entity Relationship Diagram</h2><p>Drag tables to reposition them. Layout and zoom are saved with the history entry.</p></div>
+        <button class="secondary" onclick="resetERLayout()">Reset Layout</button>
+      </div>
+      <div class="er-wrap">
+        <svg id="erGraph" viewBox="0 0 1200 700" role="img" aria-label="SQL entity relationship diagram"></svg>
+        <div class="empty-state" id="erEmpty">Run a query containing one or more tables to generate the diagram.</div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-analysis"><div id="analysisContent" class="content-grid"></div></section>
+
+    <section class="tab-panel" id="tab-performance">
+      <div class="metric-card">
+        <div><span class="metric-label">Plan status</span><strong id="performanceStatus">—</strong></div>
+        <div><span class="metric-label">Plan steps</span><strong id="performanceSteps">—</strong></div>
+      </div>
+      <div id="performanceContent" class="content-grid"></div>
+    </section>
+
+    <section class="tab-panel" id="tab-security"><div id="securityContent"></div></section>
+    <section class="tab-panel" id="tab-output"><div id="outputContent"></div></section>
+
+    <section class="tab-panel" id="tab-ai">
+      <div class="ai-layout">
+        <div class="ai-panel"><div class="panel-kicker">AI TUTOR</div><h2 id="aiTitle">Waiting for a query</h2><div id="aiSummary"></div></div>
+        <div class="ai-panel"><div class="panel-kicker">LEARN</div><div id="aiTeaching"></div></div>
+        <div class="ai-panel"><div class="panel-kicker">IMPROVE</div><div id="aiSuggestions"></div></div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-database">
+      <div class="panel-toolbar"><div><h2>Personal Database</h2><p>This sandbox belongs to your account. Queries run read-only against it.</p></div><button class="secondary" onclick="loadDatabaseSchema()">Refresh Schema</button></div>
+      <div id="databaseContent" class="schema-grid"></div>
+    </section>
+
+    <section class="tab-panel" id="tab-history">
+      <div class="panel-toolbar"><div><h2>History</h2><p>Restore a previous query together with its AI analysis, output, and ER diagram state.</p></div></div>
+      <div id="historyList" class="history-list"></div>
+    </section>
+  </main>
+</div>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="/static/script.js"></script>
+</body>
+</html>

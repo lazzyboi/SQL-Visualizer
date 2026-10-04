@@ -1,0 +1,6 @@
+Flask>=3.1,<4
+PyMongo>=4.10,<5
+sqlparse>=0.5,<1
+requests>=2.32,<3
+gunicorn>=23,<24
+python-dotenv>=1.0,<2

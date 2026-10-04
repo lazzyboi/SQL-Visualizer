@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Database · SQL Visualizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">ADMIN DATABASE CONSOLE</div>
+      <h1>Project Data</h1>
+      <p>Inspect the application database, query history, and user sandboxes.</p>
+    </div>
+    <div class="account-area">
+      <div class="account-chip"><span class="account-label">Admin</span><strong>{{ user.email }}</strong></div>
+      <a class="logout-link" href="/">Workspace</a>
+      <a class="logout-link" href="/logout">Log out</a>
+    </div>
+  </header>
+
+  <div id="adminStatus" class="content-card">Loading database status…</div>
+
+  <nav class="tabs" aria-label="Admin sections">
+    <button class="tab active" data-admin-tab="overview">Overview</button>
+    <button class="tab" data-admin-tab="users">Users</button>
+    <button class="tab" data-admin-tab="queries">Queries</button>
+    <button class="tab" data-admin-tab="sandboxes">Sandbox Databases</button>
+  </nav>
+
+  <section class="tab-panel active" id="admin-overview"><div id="overviewContent" class="content-grid"></div></section>
+  <section class="tab-panel" id="admin-users"><div id="usersContent" class="content-grid"></div></section>
+  <section class="tab-panel" id="admin-queries"><div id="queriesContent" class="content-grid"></div></section>
+  <section class="tab-panel" id="admin-sandboxes"><div id="sandboxesContent" class="content-grid"></div></section>
+</div>
+<script>
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+let adminData = null;
+
+document.querySelectorAll('[data-admin-tab]').forEach(button => button.addEventListener('click', () => {
+  const tab = button.dataset.adminTab;
+  document.querySelectorAll('[data-admin-tab]').forEach(b => b.classList.toggle('active', b === button));
+  document.querySelectorAll('#admin-overview,#admin-users,#admin-queries,#admin-sandboxes').forEach(panel => panel.classList.toggle('active', panel.id === `admin-${tab}`));
+  if (tab === 'sandboxes') renderSandboxes();
+}));
+
+async function loadAdmin() {
+  const response = await fetch('/api/admin/overview');
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Unable to load admin data');
+  adminData = data;
+  renderOverview(); renderUsers(); renderQueries(); renderSandboxes();
+}
+
+function renderOverview() {
+  const mongo = adminData.mongo;
+  const connected = mongo.auth.connected && mongo.history.connected;
+  document.getElementById('adminStatus').className = `content-card ${connected ? 'success' : 'warn'}`;
+  document.getElementById('adminStatus').innerHTML = `<strong>MongoDB:</strong> ${connected ? 'Connected' : 'Not connected'} · <strong>Database:</strong> ${esc(mongo.auth.database || 'local fallback')} · <strong>Cluster:</strong> ${esc(mongo.auth.host || 'local')} · <strong>User:</strong> ${esc(mongo.auth.username || 'local')} · <strong>History:</strong> ${esc(mongo.history.history_collection || 'local fallback')}`;
+  document.getElementById('overviewContent').innerHTML = `
+    <div class="metric-card"><div><span class="metric-label">Users</span><strong>${adminData.users.length}</strong></div><div><span class="metric-label">Loaded queries</span><strong>${adminData.queries.length}</strong></div><div><span class="metric-label">Mongo collections</span><strong>${mongo.collections.length}</strong></div></div>
+    <div class="content-card"><h2>MongoDB connection</h2><p>${esc(mongo.auth.message)}</p><p>${esc(mongo.history.message)}</p><p class="muted">The connection URI and database password are kept in Render environment secrets. This page never prints the MongoDB password.</p></div>
+    <div class="schema-grid">${mongo.collections.map(c => `<div class="schema-card"><div class="schema-heading"><h3>${esc(c.name)}</h3><span>${esc(c.count)} document(s)</span></div></div>`).join('')}</div>`;
+}
+
+function renderUsers() {
+  document.getElementById('usersContent').innerHTML = adminData.users.map(user => `<div class="content-card"><div class="history-top"><div><h2>${esc(user.email)}</h2><span class="badge">${esc(user.role || 'user')}</span></div><span class="history-date">${esc(user.created_at)}</span></div><div class="table-scroll"><table><tbody><tr><th>User ID</th><td>${esc(user.id)}</td></tr><tr><th>Password hash</th><td><code>${esc(user.password_hash || 'n/a')}</code></td></tr><tr><th>Created</th><td>${esc(user.created_at)}</td></tr></tbody></table></div><button class="secondary" onclick="loadSandbox('${esc(user.id)}')">Inspect sandbox</button></div>`).join('');
+}
+
+function renderQueries() {
+  const emails = Object.fromEntries(adminData.users.map(u => [u.id, u.email]));
+  document.getElementById('queriesContent').innerHTML = adminData.queries.map(item => `<div class="history-card"><div class="history-top"><span class="badge">${esc(emails[item.user_id] || item.user_id)}</span><span class="history-date">${esc(item.created_at)}</span></div><pre class="admin-code">${esc(item.query)}</pre><div class="history-meta"><span>AI: ${esc(item.ai?.provider || 'fallback')}</span><span>Output: ${item.output?.available ? 'available' : 'not configured'}</span></div></div>`).join('') || '<div class="content-card">No queries stored yet.</div>';
+}
+
+function renderSandboxes() {
+  const target = document.getElementById('sandboxesContent');
+  target.innerHTML = '<div class="content-card"><p>Select <strong>Inspect sandbox</strong> from the Users tab.</p></div>';
+}
+
+async function loadSandbox(userId) {
+  document.querySelector('[data-admin-tab="sandboxes"]').click();
+  const target = document.getElementById('sandboxesContent');
+  target.innerHTML = '<div class="content-card">Loading sandbox…</div>';
+  const response = await fetch(`/api/admin/sandbox/${encodeURIComponent(userId)}`);
+  const data = await response.json();
+  if (!response.ok) { target.innerHTML = `<div class="content-card error">${esc(data.error || 'Unable to load sandbox')}</div>`; return; }
+  target.innerHTML = `<div class="content-card"><h2>${esc(data.user.email)}</h2><p>SQLite sandbox database: <code>${esc(data.database_path)}</code></p></div>` + data.previews.map(item => `<div class="content-card"><div class="history-top"><h2>${esc(item.table)}</h2><span class="badge">preview</span></div><div class="table-scroll"><table><thead><tr>${item.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${item.rows.map(row => `<tr>${item.columns.map(c => `<td>${esc(row[c])}</td>`).join('')}</tr>`).join('')}</tbody></table></div></div>`).join('');
+}
+
+loadAdmin().catch(error => {
+  document.getElementById('adminStatus').className = 'content-card error';
+  document.getElementById('adminStatus').textContent = error.message;
+});
+</script>
+</body>
+</html>

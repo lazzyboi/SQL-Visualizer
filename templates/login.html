@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login · SQL Visualizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <section class="auth-card">
+      <div class="eyebrow">SQL LEARNING PLATFORM</div>
+      <h1>Welcome back</h1>
+      <p class="auth-subtitle">Sign in to your private SQL workspace.</p>
+      {% if error %}<div class="form-error">{{ error }}</div>{% endif %}
+      <form method="post" class="auth-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Email<input type="email" name="email" autocomplete="email" required></label>
+        <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p class="auth-switch">New here? <a href="/register">Create an account</a></p>
+    </section>
+  </main>
+</body>
+</html>

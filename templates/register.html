@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Register · SQL Visualizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <section class="auth-card">
+      <div class="eyebrow">SQL LEARNING PLATFORM</div>
+      <h1>Create account</h1>
+      <p class="auth-subtitle">Your account gets its own SQL sandbox and history.</p>
+      {% if error %}<div class="form-error">{{ error }}</div>{% endif %}
+      <form method="post" class="auth-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Email<input type="email" name="email" autocomplete="email" required></label>
+        <label>Password<input type="password" name="password" autocomplete="new-password" minlength="8" required></label>
+        <label>Confirm password<input type="password" name="confirmation" autocomplete="new-password" minlength="8" required></label>
+        <button type="submit">Create account</button>
+      </form>
+      <p class="auth-switch">Already registered? <a href="/login">Sign in</a></p>
+    </section>
+  </main>
+</body>
+</html>

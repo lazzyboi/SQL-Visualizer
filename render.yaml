@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: sql-visualizer
+    runtime: python
+    plan: 0.5c-512mb
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /healthz
+    numInstances: 1
+    disk:
+      name: sqlviz-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: USERS_DIR
+        value: /var/data/users
+      - key: AUTH_DB_PATH
+        value: /var/data/app.db
+      - key: HISTORY_FILE
+        value: /var/data/history.json
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
+      - key: SECRET_KEY
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: sqlvisualizer
+      - key: MONGO_USERS_COLLECTION
+        value: users
+      - key: MONGO_HISTORY_COLLECTION
+        value: query_history
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: AI_PROVIDER
+        value: fallback
+      - key: OLLAMA_URL
+        value: http://127.0.0.1:11434/api/generate
+      - key: OLLAMA_MODEL
+        value: qwen3:4b
+
