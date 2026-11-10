@@ -3,7 +3,7 @@ from functools import wraps
 import math
 import secrets
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import (
@@ -36,6 +36,12 @@ from services.output import execute_read_only
 from services.parser import parse_query
 from services.performance import explain_query
 from services.security import scan
+from services.session_db_store import (
+    SessionDatabaseStoreError,
+    acquire_session_database_lock,
+    persist_session_database,
+    session_database_store_status,
+)
 from services.storage import (
     StorageUnavailable,
     admin_list_queries,
@@ -56,6 +62,7 @@ from services.sessions import (
     mark_workspace_cleared,
     rename_workspace,
     touch_workspace,
+    ensure_workspace_database,
 )
 
 app = Flask(__name__)
@@ -92,6 +99,84 @@ def select_workspace(user_id: str, workspace_id: str) -> dict | None:
     if workspace is not None:
         session["workspace_id"] = workspace["id"]
     return workspace
+
+
+_SESSION_DB_ENDPOINTS = {
+    "analyze_query",
+    "history_item",
+    "update_history_state",
+    "db_schema",
+    "clear_database",
+    "canonical_er_model",
+    "ai_ask",
+}
+
+
+@app.before_request
+def restore_request_workspace_database():
+    """Hydrate the selected session's SQLite file before any DB-backed route."""
+    if request.endpoint not in _SESSION_DB_ENDPOINTS:
+        return None
+    user = current_user()
+    if user is None:
+        return None
+
+    requested_session_id = ""
+    if request.endpoint == "analyze_query":
+        body = request.get_json(silent=True) or {}
+        requested_session_id = str(body.get("session_id") or "").strip()
+    elif request.endpoint == "history_item":
+        requested_session_id = str(request.args.get("session_id") or "").strip()
+    elif request.endpoint == "update_history_state":
+        body = request.get_json(silent=True) or {}
+        requested_session_id = str(body.get("session_id") or "").strip()
+
+    workspace = (
+        get_workspace(user["id"], requested_session_id)
+        if requested_session_id
+        else current_workspace(user["id"])
+    )
+    if workspace is None:
+        return None  # The route itself returns the correct not-found response.
+
+    lock = acquire_session_database_lock(user["id"], workspace["id"])
+    try:
+        db_path = ensure_workspace_database(user["id"], workspace)
+        g.sqlviz_session_database = {
+            "user_id": user["id"],
+            "session_id": workspace["id"],
+            "path": db_path,
+            "lock": lock,
+        }
+    except SessionDatabaseStoreError as exc:
+        lock.release()
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        lock.release()
+        app.logger.exception("Could not prepare the selected session database")
+        return jsonify({"error": f"Unable to prepare session database: {type(exc).__name__}"}), 503
+    return None
+
+
+@app.after_request
+def persist_request_workspace_database(response):
+    """Write changed SQLite files to Atlas before returning a successful response."""
+    context = getattr(g, "sqlviz_session_database", None)
+    if context is not None:
+        try:
+            # Persist even when a later operation returned an error: an SQLite
+            # operation may already have committed before another step failed.
+            persist_session_database(
+                context["user_id"], context["session_id"], context["path"]
+            )
+        except SessionDatabaseStoreError as exc:
+            app.logger.exception("Could not persist the selected session database")
+            response.status_code = 503
+            response.set_data(jsonify({"error": str(exc)}).get_data())
+            response.content_type = "application/json"
+        finally:
+            context["lock"].release()
+    return response
 
 
 def ensure_csrf_token() -> str:
@@ -320,8 +405,12 @@ def _repair_history_item(user_id: str, session_id: str, item: dict, data_state: 
 def healthz():
     auth_status = auth_mongo_status()
     history_status = history_mongo_status()
+    session_db_status = session_database_store_status()
     mongo_ok = (not auth_status["configured"] and APP_ENV != "production") or (
-        auth_status["configured"] and auth_status["connected"] and history_status["connected"]
+        auth_status["configured"]
+        and auth_status["connected"]
+        and history_status["connected"]
+        and session_db_status["connected"]
     )
     status_code = 200 if mongo_ok else 503
     return jsonify({
@@ -331,6 +420,7 @@ def healthz():
             "configured": auth_status["configured"],
             "connected": auth_status["connected"] and history_status["connected"],
         },
+        "session_database_storage": session_db_status,
     }), status_code
 
 

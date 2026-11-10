@@ -18,6 +18,11 @@ from config import (
 )
 from services.auth import get_session_db_path, initialize_session_database
 from services.storage import migrate_legacy_history, delete_history_for_session
+from services.session_db_store import (
+    delete_session_database,
+    persist_session_database,
+    restore_session_database,
+)
 
 _collection = None
 _client = None
@@ -101,20 +106,44 @@ def _path(user_id: str, session_id: str) -> str:
 
 
 def _ensure_db_filespace(user_id: str, workspace: dict[str, Any]) -> None:
+    """Ensure the session SQLite file exists and is backed by durable storage.
+
+    MongoDB GridFS is the source of truth whenever MONGO_URI is configured.
+    The local SQLite file is only a request-time working copy on Render Free.
+    Existing local files are uploaded when no remote copy exists, which also
+    migrates local development databases to Atlas before deployment.
+    """
     path = _path(user_id, workspace["id"])
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+
+    # Always prefer a durable remote copy. This is essential after a Render
+    # restart/redeploy, where the previous instance's local filesystem is gone.
+    if restore_session_database(user_id, workspace["id"], path):
         return
 
-    # The first default workspace inherits the legacy per-user sandbox. This is
-    # a one-time compatibility migration; the legacy file is never used again.
+    # A local copy may be present during first-time migration from the current
+    # developer machine. Upload it rather than replacing it with sample data.
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        persist_session_database(user_id, workspace["id"], path)
+        return
+
+    # The first default workspace may inherit the legacy per-user sandbox.
     if workspace.get("default_session"):
-        legacy_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))), "sandbox.db")
+        user_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        legacy_path = os.path.join(user_dir, "sandbox.db")
         if os.path.exists(legacy_path) and os.path.getsize(legacy_path) > 0:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             shutil.copy2(legacy_path, path)
+            persist_session_database(user_id, workspace["id"], path)
             return
 
     initialize_session_database(path, seed_demo=workspace.get("data_state") != "cleared")
+    persist_session_database(user_id, workspace["id"], path)
+
+
+def ensure_workspace_database(user_id: str, workspace: dict[str, Any]) -> str:
+    """Restore or initialize one workspace database and return its local path."""
+    _ensure_db_filespace(user_id, workspace)
+    return _path(user_id, workspace["id"])
 
 
 def list_workspaces(user_id: str) -> list[dict[str, Any]]:
@@ -326,6 +355,8 @@ def delete_workspace(user_id: str, session_id: str) -> dict[str, Any]:
         # failed. Its database is still removed below.
         pass
 
+    # Remove the durable SQLite file before deleting the request-time copy.
+    delete_session_database(user_id, session_id)
     path = _path(user_id, session_id)
     workspace_dir = os.path.dirname(path)
     shutil.rmtree(workspace_dir, ignore_errors=True)
