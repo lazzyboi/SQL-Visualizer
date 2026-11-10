@@ -1,28 +1,243 @@
 let currentResult = null;
-let erState = { nodes: [], links: [], zoom: 1, translate: [0, 0] };
-let simulation = null;
-let erZoom = null;
-let savingTimer = null;
+let erModel = null;
+let erLayout = { version: 3, mode: "full", nodes: [], zoom: 1, translate: [0, 0] };
+let erMode = "full";
+let selectedElement = null;
 let csrfToken = "";
+let saveTimer = null;
+let dragState = null;
+let panState = null;
+let resizeState = null;
+let currentGeometry = null;
+let schemaLoadedByAction = false;
+let aiRequestBusy = false;
 
-const defaultERState = () => ({ nodes: [], links: [], zoom: 1, translate: [0, 0] });
+const SVG_NS = "http://www.w3.org/2000/svg";
 
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char]));
+const $ = (id) => document.getElementById(id);
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    "\"": "&quot;"
+  }[c]));
 }
 
-function setStatus(message) { document.getElementById("status").textContent = message; }
-
-function activateTab(tab) {
-  document.querySelectorAll(".tab").forEach(button => button.classList.toggle("active", button.dataset.tab === tab));
-  document.querySelectorAll(".tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${tab}`));
+function setStatus(message) {
+  const el = $("status");
+  if (el) el.textContent = message;
 }
 
-document.querySelectorAll(".tab").forEach(button => button.addEventListener("click", () => {
-  activateTab(button.dataset.tab);
-  if (button.dataset.tab === "history") loadHistory();
-  if (button.dataset.tab === "database") loadDatabaseSchema();
-}));
+let currentWorkspace = null;
+let workspaces = [];
+let historyLoadSequence = 0;
+
+function toggleSessionMenu(force = null) {
+  const menu = $("sessionMenu");
+  const trigger = $("sessionTrigger");
+  if (!menu || !trigger) return;
+  const currentlyOpen = !menu.hidden;
+  const shouldOpen = force === null ? !currentlyOpen : Boolean(force);
+  menu.hidden = !shouldOpen;
+  trigger.setAttribute("aria-expanded", String(shouldOpen));
+}
+
+function renderWorkspaceList() {
+  const target = $("sessionList");
+  if (!target) return;
+  if (!workspaces.length) {
+    target.innerHTML = `<div class="session-empty">No workspaces yet.</div>`;
+    return;
+  }
+  target.innerHTML = workspaces.map((workspace) => {
+    const active = currentWorkspace?.id === workspace.id;
+    const date = workspace.updated_at ? new Date(workspace.updated_at).toLocaleString() : "";
+    const state = workspace.data_state === "cleared" ? "Empty schema" : "Sample data";
+    return `
+      <article class="session-item ${active ? "active" : ""}">
+        <button class="session-select" onclick="selectWorkspace('${esc(workspace.id)}')">
+          <span class="session-item-mark">${active ? "●" : "○"}</span>
+          <span class="session-item-copy">
+            <strong>${esc(workspace.name)}</strong>
+            <small>${esc(state)} · ${esc(date)}</small>
+          </span>
+        </button>
+        <div class="session-item-actions">
+          <button class="icon-button" title="Rename workspace" onclick="renameWorkspace('${esc(workspace.id)}')">✎</button>
+          <button class="icon-button danger-icon" title="Delete workspace" onclick="deleteWorkspace('${esc(workspace.id)}')">×</button>
+        </div>
+      </article>`;
+  }).join("");
+}
+
+function applyWorkspace(workspace) {
+  currentWorkspace = workspace || null;
+  const name = currentWorkspace?.name || "My Workspace";
+  if ($("sessionName")) $("sessionName").textContent = name;
+  if ($("workspaceBadge")) $("workspaceBadge").textContent = `Session · ${name}`;
+  renderWorkspaceList();
+}
+
+async function loadWorkspaces() {
+  const response = await fetch("/api/sessions");
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Unable to load workspaces");
+  workspaces = Array.isArray(data.sessions) ? data.sessions : [];
+  applyWorkspace(data.current);
+}
+
+async function selectWorkspace(id) {
+  if (!id || currentWorkspace?.id === id) {
+    toggleSessionMenu(false);
+    return;
+  }
+  setStatus("Switching workspace…");
+  try {
+    await ensureCsrf();
+    const response = await fetch("/api/sessions/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ id })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Unable to switch workspace");
+    await switchToWorkspace(data.session);
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Workspace switch failed");
+  }
+}
+
+async function switchToWorkspace(workspace) {
+  applyWorkspace(workspace);
+  toggleSessionMenu(false);
+  currentResult = null;
+  erModel = null;
+  selectedElement = null;
+  schemaLoadedByAction = false;
+  erLayout = { version: 3, mode: "full", nodes: [], zoom: 1, translate: [0, 0] };
+  erMode = "full";
+  if ($("query")) $("query").value = "";
+  setERMode("full");
+  renderInitialPanels();
+  clearERCanvas();
+  setStatus(`Opening ${workspace.name}…`);
+  await loadHistory();
+  setStatus(`${workspace.name} ready · enter a query to begin`);
+}
+
+async function createWorkspace() {
+  const proposed = window.prompt("Name this SQL session", `Session ${workspaces.length + 1}`);
+  if (proposed === null) return;
+  const name = proposed.trim();
+  if (!name) {
+    setStatus("Workspace name cannot be empty");
+    return;
+  }
+  setStatus("Creating workspace…");
+  try {
+    await ensureCsrf();
+    const response = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ name })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Unable to create workspace");
+    workspaces = Array.isArray(data.sessions) ? data.sessions : workspaces;
+    await switchToWorkspace(data.session);
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Workspace creation failed");
+  }
+}
+
+async function renameWorkspace(id) {
+  const workspace = workspaces.find((item) => item.id === id);
+  if (!workspace) return;
+  const proposed = window.prompt("Rename workspace", workspace.name);
+  if (proposed === null) return;
+  const name = proposed.trim();
+  if (!name) {
+    setStatus("Workspace name cannot be empty");
+    return;
+  }
+  try {
+    await ensureCsrf();
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ name })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Unable to rename workspace");
+    workspaces = workspaces.map((item) => item.id === id ? data.session : item);
+    if (currentWorkspace?.id === id) applyWorkspace(data.session);
+    renderWorkspaceList();
+    setStatus("Workspace renamed");
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Rename failed");
+  }
+}
+
+async function deleteWorkspace(id) {
+  const workspace = workspaces.find((item) => item.id === id);
+  if (!workspace) return;
+  const confirmed = window.confirm(
+    `Delete “${workspace.name}”?\n\n` +
+    "This removes its database sandbox, saved query history, ER layouts, and session data.\n\nThis cannot be undone."
+  );
+  if (!confirmed) return;
+
+  setStatus("Deleting workspace…");
+  try {
+    await ensureCsrf();
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "X-CSRF-Token": csrfToken }
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Unable to delete workspace");
+    workspaces = Array.isArray(data.sessions) ? data.sessions : [];
+    if (data.deleted_id === currentWorkspace?.id) {
+      await switchToWorkspace(data.session);
+    } else {
+      applyWorkspace(data.session || currentWorkspace);
+      toggleSessionMenu(true);
+      setStatus("Workspace deleted");
+    }
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Delete failed");
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const switcher = $("sessionSwitcher");
+  if (!switcher || switcher.contains(event.target)) return;
+  toggleSessionMenu(false);
+});
+
+function activatePanel(name) {
+  document.querySelectorAll(".learning-tab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.panel === name);
+  });
+  document.querySelectorAll(".learning-panel").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === `panel-${name}`);
+  });
+  if (name === "history") loadHistory();
+}
+
+function setERMode(mode) {
+  erMode = mode === "focus" ? "focus" : "full";
+  $("modeFull")?.classList.toggle("active", erMode === "full");
+  $("modeFocus")?.classList.toggle("active", erMode === "focus");
+  drawER();
+}
 
 async function ensureCsrf() {
   if (csrfToken) return csrfToken;
@@ -34,261 +249,1148 @@ async function ensureCsrf() {
 }
 
 async function runAnalysis() {
-  const query = document.getElementById("query").value.trim();
-  if (!query) { setStatus("Enter a query first"); return; }
-  const button = document.getElementById("analyzeButton");
-  button.disabled = true;
-  setStatus("Analyzing…");
+  const queryNode = $("query");
+  if (!queryNode) return;
+  const query = queryNode.value.trim();
+  if (!query) {
+    setStatus("Enter a query first");
+    return;
+  }
+  const button = $("analyzeButton");
+  const submittedSessionId = currentWorkspace?.id || null;
+  if (button) button.disabled = true;
+  setStatus("Analyzing schema + query…");
   try {
     await ensureCsrf();
     const response = await fetch("/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
-      body: JSON.stringify({ query, er_state: defaultERState() })
+      body: JSON.stringify({
+        query,
+        session_id: submittedSessionId,
+        er_layout: erLayout
+      })
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Analysis failed");
+    // The request is saved against the session selected when Analyze was
+    // clicked. Do not paint its result into a different session if the user
+    // switched workspaces while the request was running.
+    if (submittedSessionId && currentWorkspace?.id !== submittedSessionId) {
+      setStatus("Query saved to its original session. Switch back to view it in History.");
+      return;
+    }
     currentResult = data;
-    erState = data.er_state || defaultERState();
-    renderAll(data);
-    activateTab("er");
-    await loadHistory();
-    setStatus(data.parsed?.validation_errors?.length ? "Review the query issues" : "Analysis complete");
+    hydrateResult(data);
+    activatePanel("analysis");
+    setStatus(data.parsed?.validation_errors?.length ? "Review query issues" : "Analysis complete");
   } catch (error) {
-    setStatus(error.message);
+    console.error(error);
+    setStatus(error.message || "Analysis failed");
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
-function renderAll(result) {
-  drawER(result.parsed?.er, result.er_state || defaultERState());
-  renderAnalysis(result.parsed);
-  renderPerformance(result.performance);
+function hydrateResult(result) {
+  currentResult = result;
+  erModel = result.er_model || erModel;
+  erLayout = mergeLayoutWithModel(result.er_layout || result.er_state || {}, erModel);
+  selectedElement = null;
+  if ($("query")) $("query").value = result.query || $("query").value;
+  renderAnalysis(result.parsed || {});
+  renderCost(result.performance || {});
   renderSecurity(result.security || []);
-  renderOutput(result.output);
+  renderOutput(result.output || {});
   renderAI(result.ai || {});
-  loadDatabaseSchema();
+  drawER();
+  if (result.er_recovery_message) showERToast(result.er_recovery_message);
+  else hideERToast();
+}
+
+function normalizeLayout(layout) {
+  const sourceVersion = Number(layout?.version);
+  const nodes = sourceVersion >= 3 && Array.isArray(layout?.nodes) ? layout.nodes : [];
+  const seen = new Set();
+  const clean = [];
+  for (const node of nodes) {
+    const id = String(node?.id || "").toLowerCase();
+    const x = Number(node?.x);
+    const y = Number(node?.y);
+    if (!id || seen.has(id) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    seen.add(id);
+    clean.push({ id, x, y });
+  }
+  const zoomValue = Number(layout?.zoom);
+  const zoom = Number.isFinite(zoomValue) ? Math.min(3, Math.max(.3, zoomValue)) : 1;
+  const translate = Array.isArray(layout?.translate) && layout.translate.length === 2
+    ? [Number(layout.translate[0]) || 0, Number(layout.translate[1]) || 0]
+    : [0, 0];
+  return { version: 3, mode: layout?.mode === "focus" ? "focus" : "full", nodes: clean, zoom, translate };
+}
+
+function defaultEntityPositions(entities) {
+  const list = Array.isArray(entities) ? entities : [];
+  if (!list.length) return [];
+
+  // Relationship-aware layered layout. This is deliberately deterministic:
+  // parent tables stay to the left, dependent tables move right, and siblings
+  // are spaced vertically. It avoids the random/criss-cross effect of a force
+  // simulation while keeping the diagram easy to learn.
+  const ids = new Set(list.map((e) => e.id));
+  const relations = (erModel?.relationships || []).filter((r) => ids.has(r.from) && ids.has(r.to));
+  const incoming = new Map(list.map((e) => [e.id, []]));
+  const outgoing = new Map(list.map((e) => [e.id, []]));
+
+  relations.forEach((r) => {
+    if (!incoming.has(r.to) || !outgoing.has(r.from)) return;
+    incoming.get(r.to).push(r.from);
+    outgoing.get(r.from).push(r.to);
+  });
+
+  const roots = list.filter((e) => (incoming.get(e.id) || []).length === 0);
+  const queue = roots.length ? [...roots.map((e) => e.id)] : [list[0].id];
+  const depth = new Map(queue.map((id) => [id, 0]));
+
+  while (queue.length) {
+    const id = queue.shift();
+    const nextDepth = (depth.get(id) || 0) + 1;
+    for (const child of outgoing.get(id) || []) {
+      if (!depth.has(child) || nextDepth < depth.get(child)) {
+        depth.set(child, nextDepth);
+        queue.push(child);
+      }
+    }
+  }
+
+  list.forEach((e) => { if (!depth.has(e.id)) depth.set(e.id, 0); });
+
+  const columns = new Map();
+  list.forEach((entity) => {
+    const d = depth.get(entity.id) || 0;
+    if (!columns.has(d)) columns.set(d, []);
+    columns.get(d).push(entity);
+  });
+
+  const orderedColumns = [...columns.keys()].sort((a, b) => a - b);
+  const result = [];
+  const gapX = 470;
+  const gapY = 330;
+
+  orderedColumns.forEach((d, columnIndex) => {
+    const column = columns.get(d) || [];
+    column.sort((a, b) => {
+      const aParents = (incoming.get(a.id) || []).join(',');
+      const bParents = (incoming.get(b.id) || []).join(',');
+      return aParents.localeCompare(bParents) || a.name.localeCompare(b.name);
+    });
+    const totalHeight = Math.max(0, (column.length - 1) * gapY);
+    column.forEach((entity, index) => {
+      result.push({
+        id: entity.id,
+        x: 240 + columnIndex * gapX,
+        y: 500 - totalHeight / 2 + index * gapY
+      });
+    });
+  });
+
+  // Any disconnected tables are placed in a clean bottom row.
+  const placed = new Set(result.map((n) => n.id));
+  const disconnected = list.filter((e) => !placed.has(e.id));
+  disconnected.forEach((entity, index) => {
+    result.push({ id: entity.id, x: 240 + index * gapX, y: 900 });
+  });
+  return result;
+}
+
+function mergeLayoutWithModel(layout, model) {
+  const normalized = normalizeLayout(layout);
+  if (!model?.entities?.length) return normalized;
+  const defaults = new Map(defaultEntityPositions(model.entities).map((node) => [node.id, node]));
+  const saved = new Map(normalized.nodes.map((node) => [node.id, node]));
+  return {
+    ...normalized,
+    nodes: model.entities.map((entity) => {
+      const old = saved.get(entity.id);
+      const fallback = defaults.get(entity.id) || { x: 800, y: 500 };
+      return { id: entity.id, x: old?.x ?? fallback.x, y: old?.y ?? fallback.y };
+    })
+  };
+}
+
+function visibleEntities() {
+  if (!erModel?.entities) return [];
+  const search = $("erSearch")?.value.trim().toLowerCase() || "";
+  const keyOnly = Boolean($("keyFilter")?.checked);
+  return erModel.entities.filter((entity) => {
+    const attrs = entity.attributes || [];
+    const searchable = [entity.name, ...attrs.map((a) => `${entity.name}.${a.name}`)].join(" ").toLowerCase();
+    if (search && !searchable.includes(search)) return false;
+    if (erMode === "focus" && !entity.query_relevant) return false;
+    if (keyOnly && !(entity.primary_key?.length || attrs.some((a) => a.foreign_key))) return false;
+    return true;
+  });
+}
+
+function relationshipsVisible() {
+  return Boolean($("relationshipFilter")?.checked);
+}
+
+function attributesVisible() {
+  return Boolean($("attributeFilter")?.checked);
+}
+
+function renderInitialPanels() {
+  renderAnalysis({});
+  renderCost({ available: false, message: "Run a SELECT/WITH query to generate the execution plan.", plan: [], insights: [] });
+  renderSecurity([]);
+  renderOutput({ available: false, message: "Run a query to see read-only sandbox output." });
+  renderAI({ provider: "Schema Tutor", summary: [], teaching: [], suggestions: [], er_explanation: {} });
 }
 
 function renderAnalysis(parsed) {
-  const target = document.getElementById("analysisContent");
-  const errors = parsed?.validation_errors || [];
-  const html = [];
-  if (errors.length) html.push(`<div class="content-card error"><h3>Query issues</h3><ul>${errors.map(error => `<li>${escapeHtml(error)}</li>`).join("")}</ul></div>`);
-  html.push(`<div class="metric-card"><div><span class="metric-label">Base table</span><strong>${escapeHtml(parsed?.from || "—")}</strong></div><div><span class="metric-label">Selected expressions</span><strong>${parsed?.select?.length || 0}</strong></div><div><span class="metric-label">Joins</span><strong>${parsed?.joins?.length || 0}</strong></div></div>`);
-  if (parsed?.select?.length) html.push(`<div class="content-card"><h3>SELECT</h3><ul>${parsed.select.map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("")}</ul></div>`);
-  if (parsed?.joins?.length) html.push(parsed.joins.map(join => `<div class="content-card"><h3>${escapeHtml(join.type)} JOIN · ${escapeHtml(join.table)}</h3><p><code>${escapeHtml(join.on)}</code></p></div>`).join(""));
-  if (parsed?.where) html.push(`<div class="content-card"><h3>WHERE</h3><p><code>${escapeHtml(parsed.where)}</code></p></div>`);
-  if (!parsed?.validation_errors?.length && !parsed?.from && !parsed?.select?.length) html.push(`<div class="content-card"><p>Run a SQL query to populate the analysis.</p></div>`);
-  target.innerHTML = html.join("");
+  const target = $("panel-analysis");
+  if (!target) return;
+  const focusTables = erModel?.query_focus?.tables || parsed.tables || [];
+  const joins = parsed.joins || [];
+  target.innerHTML = `
+    <div class="panel-heading"><div><div class="panel-kicker">QUERY ANALYSIS</div><h2>Understand the SQL</h2></div><span class="badge">${focusTables.length} table(s)</span></div>
+    <div class="metric-grid">
+      <div><span>Base table</span><strong>${esc(parsed.from || "—")}</strong></div>
+      <div><span>Expressions</span><strong>${parsed.select?.length || 0}</strong></div>
+      <div><span>JOINs</span><strong>${joins.length}</strong></div>
+    </div>
+    ${parsed.validation_errors?.length ? `<div class="content-card error"><h3>Query issues</h3>${parsed.validation_errors.map((x) => `<p>${esc(x)}</p>`).join("")}</div>` : ""}
+    <div class="content-card">
+      <div class="card-heading-row"><div><h3>Query focus</h3><span class="muted">The schema remains authoritative.</span></div><button class="small secondary" onclick="setERMode('focus')">Show focus</button></div>
+      <div class="chip-row">${focusTables.length ? focusTables.map((t) => `<button class="entity-chip ${isFocused(t) ? "hot" : ""}" onclick="focusEntity('${esc(t)}')">${esc(t)}</button>`).join("") : `<span class="muted">Run a query to populate focus.</span>`}</div>
+    </div>
+    ${parsed.select?.length ? `<div class="content-card"><h3>SELECT</h3>${parsed.select.map((x) => `<code class="block-code">${esc(x)}</code>`).join("")}</div>` : ""}
+    ${joins.map((j) => `<div class="content-card"><h3>${esc(j.type)} JOIN · ${esc(j.table)}</h3><code class="block-code">${esc(j.on)}</code></div>`).join("")}
+    ${parsed.where ? `<div class="content-card"><h3>WHERE</h3><code class="block-code">${esc(parsed.where)}</code></div>` : ""}
+    <div class="content-card"><div class="card-heading-row"><div><h3>Database model</h3><span class="muted">${erModel?.entities?.length || 0} entities · ${erModel?.relationships?.length || 0} relationships</span></div><button class="small secondary" onclick="showEROverview()">Explain ER</button></div></div>
+  `;
 }
 
-function renderPerformance(performance) {
-  document.getElementById("performanceStatus").textContent = performance?.available ? "Ready" : "Unavailable";
-  document.getElementById("performanceSteps").textContent = performance?.plan?.length ?? "—";
-  const target = document.getElementById("performanceContent");
-  if (!performance?.available) {
-    target.innerHTML = `<div class="content-card"><h3>Performance</h3><p>${escapeHtml(performance?.message || "No execution plan available.")}</p></div>`;
-    return;
-  }
-  const insightHtml = (performance.insights || []).map(item => `<div class="content-card"><p>${escapeHtml(item)}</p></div>`).join("");
-  const rows = (performance.plan || []).map(step => `<tr><td>${escapeHtml(step.id)}</td><td>${escapeHtml(step.parent)}</td><td>${escapeHtml(step.detail)}</td></tr>`).join("");
-  target.innerHTML = `${insightHtml}<div class="content-card"><h3>SQLite execution plan</h3><table><thead><tr><th>ID</th><th>Parent</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+function renderCost(performance) {
+  const target = $("panel-cost");
+  if (!target) return;
+  const plan = performance.plan || [];
+  target.innerHTML = `
+    <div class="panel-heading"><div><div class="panel-kicker">EXECUTION COST</div><h2>Actual SQLite plan</h2></div><span class="badge ${performance.available ? "good" : ""}">${performance.available ? "Available" : "Waiting"}</span></div>
+    <div class="metric-grid"><div><span>Plan steps</span><strong>${plan.length}</strong></div><div><span>Mode</span><strong>Read-only</strong></div><div><span>Engine</span><strong>SQLite</strong></div></div>
+    <div class="content-card"><p>${esc(performance.message || "Run a query to generate an execution plan.")}</p></div>
+    ${(performance.insights || []).map((x) => `<div class="content-card"><p>${esc(x)}</p></div>`).join("")}
+    ${plan.length ? `<div class="content-card"><h3>Plan details</h3><div class="table-scroll"><table><thead><tr><th>ID</th><th>Parent</th><th>Detail</th></tr></thead><tbody>${plan.map((x) => `<tr><td>${esc(x.id)}</td><td>${esc(x.parent)}</td><td>${esc(x.detail)}</td></tr>`).join("")}</tbody></table></div></div>` : ""}
+  `;
 }
 
-function renderSecurity(security) {
-  const target = document.getElementById("securityContent");
-  if (!security?.length) {
-    target.innerHTML = `<div class="content-card success"><h3>Security</h3><p>No pattern-based findings for this query.</p></div>`;
-    return;
-  }
-  target.innerHTML = security.map(item => `<div class="content-card warn"><h3>${escapeHtml(item.pattern)}</h3><p>${escapeHtml(item.message)}</p></div>`).join("");
+function renderSecurity(items) {
+  const target = $("panel-security");
+  if (!target) return;
+  target.innerHTML = `
+    <div class="panel-heading"><div><div class="panel-kicker">QUERY SAFETY</div><h2>Security review</h2></div><span class="badge ${items.length ? "warn-badge" : "good"}">${items.length ? `${items.length} finding(s)` : "No findings"}</span></div>
+    ${items.length ? items.map((x) => `<div class="content-card warn"><h3>${esc(x.pattern)}</h3><p>${esc(x.message)}</p></div>`).join("") : `<div class="content-card success"><h3>No pattern-based findings</h3><p>The scanner checks a small set of risky SQL text patterns.</p></div>`}
+  `;
 }
 
 function renderOutput(output) {
-  const target = document.getElementById("outputContent");
-  if (!output?.available) {
-    target.innerHTML = `<div class="content-card"><span class="badge">Sandbox</span><h2>Output</h2><p>${escapeHtml(output?.message || "No execution result available.")}</p></div>`;
+  const target = $("panel-output");
+  if (!target) return;
+  if (!output.available) {
+    target.innerHTML = `<div class="panel-heading"><div><div class="panel-kicker">RESULT</div><h2>Query output</h2></div><span class="badge">Waiting</span></div><div class="content-card"><p>${esc(output.message || "Run a query to see output.")}</p></div>`;
     return;
   }
-  if (!output.rows?.length) {
-    target.innerHTML = `<div class="content-card"><h2>Output</h2><p>${escapeHtml(output.message || "The query returned no rows.")}</p></div>`;
-    return;
-  }
-  const head = output.columns.map(column => `<th>${escapeHtml(column)}</th>`).join("");
-  const body = output.rows.map(row => `<tr>${output.columns.map(column => `<td>${escapeHtml(row[column])}</td>`).join("")}</tr>`).join("");
-  target.innerHTML = `<div class="content-card output-table-card"><h2>Output</h2><p>${escapeHtml(output.message || "")}</p><div class="table-scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div></div>`;
+  const columns = output.columns || [];
+  const rows = output.rows || [];
+  target.innerHTML = `
+    <div class="panel-heading"><div><div class="panel-kicker">RESULT</div><h2>Query output</h2></div><span class="badge good">${rows.length} row(s)</span></div>
+    <div class="content-card"><p>${esc(output.message || "")}</p>${rows.length ? `<div class="table-scroll"><table><thead><tr>${columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((c) => `<td>${esc(row[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : `<p class="muted">The query returned no rows.</p>`}</div>
+  `;
 }
 
 function renderAI(ai) {
-  document.getElementById("aiTitle").textContent = ai?.provider ? `AI source: ${ai.provider}` : "AI Tutor";
-  renderAIList("aiSummary", ai?.summary || [], "summary");
-  renderAIList("aiTeaching", ai?.teaching || [], "teaching");
-  renderAIList("aiSuggestions", ai?.suggestions || [], "suggestions");
+  const target = $("panel-ai");
+  if (!target) return;
+  const explanation = ai.er_explanation || {};
+  const context = ai.context || {};
+  const entities = explanation.entities || [];
+  const relationships = explanation.relationships || [];
+  const notation = explanation.notation || [];
+  const overview = explanation.overview || ai.summary || [];
+  const suggestions = ai.suggestions || [];
+
+  target.innerHTML = `
+    <div class="panel-heading"><div><div class="panel-kicker">AI TUTOR</div><h2>${esc(ai.provider || "Schema Tutor")}</h2></div><span class="badge">${context.entity_count || erModel?.entities?.length || 0} entities</span></div>
+    <div id="aiContextCard" class="context-card"><strong>Click anything in the ER diagram.</strong><span>The tutor will explain the selected entity, attribute, relationship, key, datatype, or notation.</span></div>
+    <div class="tutor-section"><h3>Overview</h3>${overview.length ? overview.map((x) => `<div class="ai-item">${esc(x)}</div>`).join("") : `<div class="ai-item muted">Run a query or ask a question.</div>`}</div>
+    <div class="tutor-section"><h3>Entities & attributes</h3><div class="tutor-list">${entities.map((x) => `<button class="tutor-row ${x.query_relevant ? "relevant" : ""}" onclick="focusEntity('${esc(x.name)}')"><strong>${esc(x.name)}</strong><span>${esc(x.text)}</span></button>`).join("")}</div></div>
+    <div class="tutor-section"><h3>Relationships</h3><div class="tutor-list">${relationships.map((x) => `<button class="tutor-row ${x.query_relevant ? "relevant" : ""}" onclick="focusRelationship('${esc(x.name)}')"><strong>${esc(x.name)}</strong><span>${esc(x.text)}</span></button>`).join("")}</div></div>
+    <div class="tutor-section"><h3>ER notation</h3>${notation.map((x) => `<div class="ai-item">${esc(x)}</div>`).join("")}</div>
+    <div class="tutor-section"><h3>SQL teaching</h3>${(ai.teaching || []).map((x) => `<div class="ai-item">${esc(x)}</div>`).join("")}</div>
+    <div class="ai-chat">
+      <div class="ai-chat-title"><div><div class="panel-kicker">ASK THE TUTOR</div><strong>Ask about this database</strong></div><button class="small secondary" onclick="askAI('Explain the complete ER diagram and how the relationships work.')">Explain ER</button></div>
+      <textarea id="aiQuestion" class="ai-question" placeholder="Why is orders.user_id a foreign key? Why is users → orders 1:N? Explain this query…"></textarea>
+      <div class="ai-chat-actions"><button id="aiAskButton" onclick="askAI()">Ask AI</button><button class="secondary small" onclick="askAI('Explain the currently selected ER element.')">Explain selection</button><button class="secondary small" onclick="askAI('Explain the current SQL query using the ER diagram.')">Explain query</button></div>
+      <div id="aiAnswer"></div>
+      <div id="aiSuggestions" class="ai-suggestions">${suggestions.map((x) => `<button class="ai-chip" onclick="askAI('${esc(x)}')">${esc(x)}</button>`).join("")}</div>
+    </div>
+  `;
 }
 
-function renderAIList(id, items, kind) {
-  const target = document.getElementById(id);
-  target.innerHTML = items.length ? items.map(item => `<div class="ai-item ${kind === "suggestions" ? "warn" : ""}">${escapeHtml(item)}</div>`).join("") : `<div class="ai-item">Nothing to add here yet.</div>`;
+function updateTutorContext(title, text) {
+  const card = $("aiContextCard");
+  if (!card) return;
+  card.innerHTML = `<strong>${esc(title)}</strong><span>${esc(text)}</span>`;
 }
 
-function stopERSimulation() {
-  if (simulation) { simulation.stop(); simulation = null; }
+function showEROverview() {
+  selectedElement = null;
+  clearSelectionStyles();
+  const count = erModel?.entities?.length || 0;
+  const relationships = erModel?.relationships?.length || 0;
+  updateTutorContext("Complete ER model", `The model contains ${count} entities and ${relationships} relationships. Rectangles are entities, ovals are attributes, diamonds are relationships, and underlined attributes are primary keys.`);
+  activatePanel("ai");
 }
 
-function applyERState(nodes) {
-  nodes.forEach(node => {
-    if (Number.isFinite(node.x) && Number.isFinite(node.y)) { node.fx = node.x; node.fy = node.y; }
-  });
+function findEntity(name) {
+  const wanted = String(name || "").toLowerCase();
+  return erModel?.entities?.find((entity) => String(entity.name).toLowerCase() === wanted || String(entity.id).toLowerCase() === wanted) || null;
 }
 
-function drawER(schema, savedState = {}) {
-  const svg = d3.select("#erGraph");
-  stopERSimulation();
-  svg.selectAll("*").remove();
-  const empty = document.getElementById("erEmpty");
-  const tables = schema?.tables || [];
-  const relationships = schema?.relationships || [];
-  empty.style.display = tables.length ? "none" : "grid";
-  if (!tables.length) { erState = defaultERState(); return; }
+function focusEntity(name, openTutor = true) {
+  const entity = findEntity(name);
+  if (!entity) return;
+  selectedElement = { type: "entity", id: entity.id };
+  clearSelectionStyles();
+  markSelection();
+  const relationships = (erModel.relationships || []).filter((r) => r.from === entity.id || r.to === entity.id);
+  const attrs = (entity.attributes || []).map((a) => `${a.name} (${a.type}${a.key ? `, ${a.key}` : ""}${a.foreign_key ? ", FK" : ""})`).join("; ");
+  updateTutorContext(`${entity.name} — entity`, `Primary key: ${(entity.primary_key || []).join(", ") || "none declared"}. Attributes: ${attrs || "none"}. Relationships: ${relationships.length}.`);
+  centerOnEntity(entity.id);
+  if (openTutor) activatePanel("ai");
+}
 
-  const savedNodes = new Map((savedState.nodes || []).map(node => [node.id, node]));
-  const hasSavedLayout = tables.every(table => savedNodes.has(table.id));
-  const nodes = tables.map((table, index) => {
-    const saved = savedNodes.get(table.id);
-    return { ...table, x: saved?.x ?? 180 + (index % 4) * 250, y: saved?.y ?? 150 + Math.floor(index / 4) * 220, fx: null, fy: null };
+function focusAttribute(entityId, attributeId, openTutor = true) {
+  const entity = erModel?.entities?.find((e) => e.id === entityId);
+  const attribute = entity?.attributes?.find((a) => a.id === attributeId);
+  if (!entity || !attribute) return;
+  selectedElement = { type: "attribute", id: attribute.id };
+  clearSelectionStyles();
+  markSelection();
+  let text = `${entity.name}.${attribute.name} is ${attribute.type}.`;
+  if (attribute.key) text += ` Key role: ${attribute.key}.`;
+  if (attribute.foreign_key) text += " It is a foreign key.";
+  if (attribute.references) text += ` It references ${attribute.references.table}.${attribute.references.column}.`;
+  text += attribute.nullable ? " It is nullable." : " It is NOT NULL.";
+  updateTutorContext(`${entity.name}.${attribute.name} — attribute`, text);
+  centerOnEntity(entity.id);
+  if (openTutor) activatePanel("ai");
+}
+
+function focusRelationship(name, openTutor = true) {
+  const relationship = erModel?.relationships?.find((r) => r.name === String(name));
+  if (!relationship) return;
+  selectedElement = { type: "relationship", id: relationship.id };
+  clearSelectionStyles();
+  markSelection();
+  const source = findEntityById(relationship.from);
+  const target = findEntityById(relationship.to);
+  let text = `${relationship.name} is ${relationship.cardinality}. ${relationship.from_attributes?.join(", ") || "parent key"} connects to ${relationship.to_attributes?.join(", ") || "child key"}.`;
+  text += ` Participation: ${relationship.participation?.from || "unknown"} on the parent side and ${relationship.participation?.to || "unknown"} on the child side.`;
+  if (relationship.identifying) text += " It is an identifying relationship.";
+  if (relationship.inferred_from_query) text += " This particular connection was inferred from the SQL JOIN.";
+  updateTutorContext(`${relationship.name} — relationship`, `${text} Entities: ${source?.name || relationship.from} ↔ ${target?.name || relationship.to}.`);
+  centerOnRelationship(relationship.id);
+  if (openTutor) activatePanel("ai");
+}
+
+function findEntityById(id) {
+  return erModel?.entities?.find((entity) => entity.id === id) || null;
+}
+
+function isFocused(tableName) {
+  return Boolean(erModel?.query_focus?.tables?.includes(String(tableName).toLowerCase()));
+}
+
+function applyERFilters() {
+  drawER();
+}
+
+function entitySize(entity) {
+  return { width: Math.max(190, Math.min(260, 150 + String(entity.name).length * 7)), height: 68 };
+}
+
+function svgEl(tag, attrs = {}) {
+  const el = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, value));
+  return el;
+}
+
+function svgText(parent, text, attrs = {}) {
+  const node = svgEl("text", attrs);
+  node.textContent = String(text ?? "");
+  parent.appendChild(node);
+  return node;
+}
+
+function edgePoint(center, target, width, height) {
+  const dx = target.x - center.x;
+  const dy = target.y - center.y;
+  const absX = Math.abs(dx);
+  const absY = Math.abs(dy);
+  let scale = 1;
+  if (absX > 0) scale = Math.min(scale, (width / 2) / absX);
+  if (absY > 0) scale = Math.min(scale, (height / 2) / absY);
+  return { x: center.x + dx * scale, y: center.y + dy * scale };
+}
+
+function attributePoint(center, target) {
+  const dx = target.x - center.x;
+  const dy = target.y - center.y;
+  const dist = Math.max(1, Math.hypot(dx, dy));
+  const edge = 55;
+  return { x: center.x + dx / dist * edge, y: center.y + dy / dist * edge };
+}
+
+function attributeAngle(index, total) {
+  if (total <= 6) {
+    const angles = [-Math.PI / 2, -Math.PI / 6, Math.PI / 6, 5 * Math.PI / 6, 7 * Math.PI / 6, 5 * Math.PI / 3];
+    return angles[index] ?? (-Math.PI / 2 + index * ((Math.PI * 2) / total));
+  }
+  return -Math.PI / 2 + index * ((Math.PI * 2) / total);
+}
+
+function attributeOrbit(index) {
+  return 225 + (index % 2) * 18;
+}
+
+function getPositions(entities) {
+  const defaults = new Map(defaultEntityPositions(entities).map((n) => [n.id, n]));
+  const positions = new Map();
+  entities.forEach((entity) => {
+    const saved = erLayout.nodes.find((node) => node.id === entity.id);
+    const fallback = defaults.get(entity.id) || { x: 800, y: 500 };
+    positions.set(entity.id, { x: saved?.x ?? fallback.x, y: saved?.y ?? fallback.y });
   });
-  const nodeMap = new Map(nodes.map(node => [node.id, node]));
-  const links = relationships.map((link, index) => ({ ...link, id: `${link.source}-${link.target}-${index}`, source: nodeMap.get(link.source), target: nodeMap.get(link.target) })).filter(link => link.source && link.target);
-  erState = {
-    nodes: nodes.map(node => ({ id: node.id, x: node.x, y: node.y })),
-    links: links.map(link => ({ id: link.id, source: link.source.id, target: link.target.id, label: link.label })),
-    zoom: Number.isFinite(savedState.zoom) ? savedState.zoom : 1,
-    translate: Array.isArray(savedState.translate) ? savedState.translate : [0, 0]
-  };
+  return positions;
+}
 
-  const root = svg.append("g").attr("class", "viewport");
-  const linkLayer = root.append("g").attr("class", "links");
-  const nodeLayer = root.append("g").attr("class", "nodes");
-  linkLayer.selectAll("line").data(links, d => d.id).join("line").attr("class", "er-link");
-  const nodeSelection = nodeLayer.selectAll("g.er-node").data(nodes, d => d.id).join(enter => enter.append("g").attr("class", "er-node"));
+function clearERCanvas(message = "Enter a SQL query and press Analyze Query to build the ER diagram.") {
+  const svg = $("erGraph");
+  if (svg) {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    svg.style.display = "none";
+  }
+  const empty = $("erEmpty");
+  if (empty) {
+    empty.style.display = "grid";
+    empty.innerHTML = `<div class="empty-symbol">◇</div><h3>Nothing to visualize yet</h3><p>${esc(message)}</p>`;
+  }
+  const subtitle = $("erSubtitle");
+  if (subtitle) subtitle.textContent = "Waiting for SQL input…";
+  const map = $("schemaMap");
+  if (map) map.style.display = "none";
+}
 
-  nodeSelection.each(function(d) {
-    const node = d3.select(this);
-    const width = Math.max(180, d.name.length * 9 + 50);
-    const height = 56 + d.columns.length * 24;
-    d._width = width; d._height = height;
-    node.selectAll("*").remove();
-    node.append("rect").attr("width", width).attr("height", height).attr("rx", 10).attr("x", -width / 2).attr("y", -height / 2);
-    node.append("rect").attr("class", "header").attr("width", width).attr("height", 36).attr("rx", 10).attr("x", -width / 2).attr("y", -height / 2);
-    node.append("text").attr("x", 0).attr("y", -height / 2 + 24).attr("text-anchor", "middle").text(d.name);
-    d.columns.forEach((column, index) => node.append("text").attr("class", "column").attr("x", -width / 2 + 12).attr("y", -height / 2 + 58 + index * 20).text(column));
-  });
-
-  const updatePositions = () => {
-    nodeSelection.attr("transform", d => `translate(${d.x},${d.y})`);
-    linkLayer.selectAll("line").attr("x1", d => d.source.x).attr("y1", d => d.source.y).attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-  };
-
-  nodeSelection.call(d3.drag()
-    .on("start", (event, d) => { event.sourceEvent.stopPropagation(); d.fx = d.x; d.fy = d.y; })
-    .on("drag", (event, d) => { d.fx = event.x; d.fy = event.y; d.x = event.x; d.y = event.y; updatePositions(); })
-    .on("end", (_event, d) => { d.fx = d.x; d.fy = d.y; updatePositions(); syncERState(nodes, links); scheduleERSave(); })
-  );
-
-  erZoom = d3.zoom().scaleExtent([0.35, 2.5]).on("zoom", event => {
-    root.attr("transform", event.transform);
-    erState.zoom = event.transform.k;
-    erState.translate = [event.transform.x, event.transform.y];
-    scheduleERSave();
-  });
-  svg.call(erZoom);
-  svg.call(erZoom.transform, d3.zoomIdentity.translate(erState.translate[0], erState.translate[1]).scale(erState.zoom));
-
-  if (hasSavedLayout) {
-    applyERState(nodes);
-    updatePositions();
-    syncERState(nodes, links);
+function drawER() {
+  const svg = $("erGraph");
+  if (!svg) return;
+  const query = $("query")?.value.trim() || "";
+  const hasUserQuery = Boolean(query || currentResult?.query);
+  if (!hasUserQuery && !schemaLoadedByAction) {
+    clearERCanvas();
     return;
   }
+  svg.style.display = "block";
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-  simulation = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links).id(d => d.id).distance(260).strength(0.45))
-    .force("charge", d3.forceManyBody().strength(-900))
-    .force("center", d3.forceCenter(600, 350))
-    .force("collision", d3.forceCollide().radius(d => Math.max(130, Math.max(d._width, d._height) / 2 + 30)))
-    .alphaDecay(0.08)
-    .on("tick", updatePositions)
-    .on("end", () => { applyERState(nodes); updatePositions(); syncERState(nodes, links); simulation.stop(); simulation = null; scheduleERSave(); });
+  const entities = visibleEntities();
+  const allCount = erModel?.entities?.length || 0;
+  const empty = $("erEmpty");
+  if (empty) empty.style.display = entities.length ? "none" : "grid";
+
+  const subtitle = $("erSubtitle");
+  if (subtitle) subtitle.textContent = `${erMode === "focus" ? "Query Focus" : "Full Schema"} · Chen notation · ${entities.length} visible / ${allCount} total`;
+
+  if (!erModel || !entities.length) {
+    updateSchemaMap([], new Map());
+    const map = $("schemaMap");
+    if (map) map.style.display = erModel ? "block" : "none";
+    return;
+  }
+  const map = $("schemaMap");
+  if (map) map.style.display = "block";
+
+  erLayout = mergeLayoutWithModel(erLayout, erModel);
+  const positions = getPositions(entities);
+  const visibleIds = new Set(entities.map((entity) => entity.id));
+  const root = svgEl("g", { class: "er-root" });
+  const relationLines = svgEl("g", { class: "relation-lines" });
+  const relationShapes = svgEl("g", { class: "relation-shapes" });
+  const attributeLines = svgEl("g", { class: "attribute-lines" });
+  const attributes = svgEl("g", { class: "attributes" });
+  const entitiesLayer = svgEl("g", { class: "entities-layer" });
+
+  root.append(relationLines, relationShapes, attributeLines, attributes, entitiesLayer);
+  svg.appendChild(root);
+
+  const relationParts = [];
+  const attributeParts = [];
+  const entityParts = [];
+
+  const relations = relationshipsVisible()
+    ? (erModel.relationships || []).filter((r) => visibleIds.has(r.from) && visibleIds.has(r.to))
+    : [];
+
+  relations.forEach((relation) => {
+    const source = findEntityById(relation.from);
+    const target = findEntityById(relation.to);
+    if (!source || !target) return;
+
+    const group = svgEl("g", { class: `relationship-group ${relation.query_relevant ? "hot" : ""}` });
+    group.dataset.relId = relation.id;
+
+    const lineA = svgEl("line", { class: "er-association" });
+    const lineB = svgEl("line", { class: "er-association" });
+    const diamond = svgEl("polygon", { class: "er-relationship" });
+    const label = svgText(group, relation.name, { class: "relationship-label", "text-anchor": "middle" });
+    const card = svgText(group, relation.cardinality || "", { class: "cardinality-label", "text-anchor": "middle" });
+    const part = svgText(group, `${relation.participation?.from || ""} / ${relation.participation?.to || ""}`, { class: "participation-label", "text-anchor": "middle" });
+
+    group.append(lineA, lineB, diamond);
+
+    if (relation.identifying) {
+      group.appendChild(svgEl("polygon", { class: "er-relationship-inner" }));
+    }
+
+    group.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (dragState?.moved) return;
+      focusRelationship(relation.name);
+    });
+
+    relationLines.append(lineA, lineB);
+    relationShapes.append(group);
+    relationParts.push({ relation, group, lineA, lineB, diamond, inner: group.querySelector(".er-relationship-inner"), label, card, part });
+  });
+
+  entities.forEach((entity) => {
+    const position = positions.get(entity.id);
+    if (!position) return;
+
+    const size = entitySize(entity);
+    const group = svgEl("g", { class: `er-entity ${entity.query_relevant ? "hot" : ""}` });
+    group.dataset.entityId = entity.id;
+
+    const rect = svgEl("rect", { x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height, rx: 2, class: `entity-box ${entity.weak ? "weak" : ""}` });
+    group.appendChild(rect);
+    if (entity.weak) group.appendChild(svgEl("rect", { x: -size.width / 2 + 7, y: -size.height / 2 + 7, width: size.width - 14, height: size.height - 14, rx: 1, class: "entity-box-inner" }));
+    svgText(group, entity.name, { x: 0, y: 6, class: "entity-title", "text-anchor": "middle" });
+
+    const hit = svgEl("rect", { x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height, fill: "transparent", cursor: "grab" });
+    hit.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+      beginEntityDrag(event, entity);
+    });
+    hit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (dragState?.moved) return;
+      focusEntity(entity.name);
+    });
+    group.appendChild(hit);
+
+    entitiesLayer.appendChild(group);
+    entityParts.push({ entity, group, position, size });
+
+    if (!attributesVisible()) return;
+
+    const attrs = entity.attributes || [];
+    attrs.forEach((attribute, index) => {
+      const keyOnly = Boolean($("keyFilter")?.checked);
+      if (keyOnly && !attribute.key && !attribute.foreign_key) return;
+      if (erMode === "focus" && !attribute.query_relevant && !attribute.key && !attribute.foreign_key) return;
+
+      const angle = attributeAngle(index, attrs.length);
+      const orbit = attributeOrbit(index);
+      const x = position.x + Math.cos(angle) * orbit;
+      const y = position.y + Math.sin(angle) * orbit * .7;
+      const rx = Math.min(120, Math.max(72, 48 + String(attribute.name).length * 2.8));
+      const ry = 26;
+      const groupAttr = svgEl("g", { class: `attribute-group ${attribute.query_relevant ? "hot" : ""}` });
+      groupAttr.dataset.attributeId = attribute.id;
+      groupAttr.dataset.entityId = entity.id;
+      const connector = svgEl("line", { class: "attribute-line" });
+      const ellipse = svgEl("ellipse", { cx: x, cy: y, rx, ry, class: `attribute-oval ${attribute.key ? "key" : ""}` });
+      groupAttr.appendChild(connector);
+      groupAttr.appendChild(ellipse);
+      if (attribute.multivalued) groupAttr.appendChild(svgEl("ellipse", { cx: x, cy: y, rx: rx + 5, ry: ry + 5, class: "attribute-oval-inner" }));
+      svgText(groupAttr, `${attribute.name} : ${attribute.type}`, { x, y: y + 3, class: "attribute-label", "text-anchor": "middle" });
+      if (attribute.key === "PK" || attribute.key === "PK/FK") groupAttr.appendChild(svgEl("line", { x1: x - Math.min(32, rx * .6), x2: x + Math.min(32, rx * .6), y1: y + 10, y2: y + 10, class: "pk-underline" }));
+      groupAttr.addEventListener("click", (event) => {
+        event.stopPropagation();
+        focusAttribute(entity.id, attribute.id);
+      });
+      attributeLines.appendChild(connector);
+      attributes.appendChild(groupAttr);
+      attributeParts.push({ entity, attribute, group: groupAttr, connector, x, y, rx, ry });
+    });
+  });
+
+  currentGeometry = { positions, relationParts, attributeParts, entityParts };
+  updateGeometry(currentGeometry);
+  applyTransform(root);
+  updateSchemaMap(entities, positions, relations);
+  markSelection();
 }
 
-function syncERState(nodes, links) {
-  erState.nodes = nodes.map(node => ({ id: node.id, x: Number(node.x), y: Number(node.y) }));
-  erState.links = links.map(link => ({ id: link.id, source: link.source.id, target: link.target.id, label: link.label }));
+function updateGeometry(geometry) {
+  if (!geometry) return;
+  const { positions, relationParts, attributeParts, entityParts } = geometry;
+
+  relationParts.forEach((part) => {
+    const source = findEntityById(part.relation.from);
+    const target = findEntityById(part.relation.to);
+    const sourcePos = positions.get(part.relation.from);
+    const targetPos = positions.get(part.relation.to);
+    if (!source || !target || !sourcePos || !targetPos) return;
+
+    const sourceSize = entitySize(source);
+    const targetSize = entitySize(target);
+    const dx = targetPos.x - sourcePos.x;
+    const dy = targetPos.y - sourcePos.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    const normalX = -dy / len;
+    const normalY = dx / len;
+    const mid = { x: (sourcePos.x + targetPos.x) / 2 + normalX * 18, y: (sourcePos.y + targetPos.y) / 2 + normalY * 18 };
+    const sourceEdge = edgePoint(sourcePos, mid, sourceSize.width, sourceSize.height);
+    const targetEdge = edgePoint(targetPos, mid, targetSize.width, targetSize.height);
+
+    const width = Math.max(60, Math.min(130, 32 + String(part.relation.name).length * 3.2));
+    const height = 24;
+    const diamondPoints = `${mid.x},${mid.y - height} ${mid.x + width},${mid.y} ${mid.x},${mid.y + height} ${mid.x - width},${mid.y}`;
+
+    part.lineA.setAttribute("x1", sourceEdge.x); part.lineA.setAttribute("y1", sourceEdge.y); part.lineA.setAttribute("x2", mid.x); part.lineA.setAttribute("y2", mid.y);
+    part.lineB.setAttribute("x1", mid.x); part.lineB.setAttribute("y1", mid.y); part.lineB.setAttribute("x2", targetEdge.x); part.lineB.setAttribute("y2", targetEdge.y);
+    part.diamond.setAttribute("points", diamondPoints);
+    if (part.inner) part.inner.setAttribute("points", `${mid.x},${mid.y - height + 5} ${mid.x + width - 6},${mid.y} ${mid.x},${mid.y + height - 5} ${mid.x - width + 6},${mid.y}`);
+    part.label.setAttribute("x", mid.x); part.label.setAttribute("y", mid.y + 3);
+    part.card.setAttribute("x", mid.x); part.card.setAttribute("y", mid.y - height - 8);
+    part.part.setAttribute("x", mid.x); part.part.setAttribute("y", mid.y + height + 13);
+  });
+
+  attributeParts.forEach((part) => {
+    const center = positions.get(part.entity.id);
+    if (!center) return;
+    const attrs = part.entity.attributes || [];
+    const index = attrs.findIndex((a) => a.id === part.attribute.id);
+    const angle = attributeAngle(index, attrs.length);
+    const orbit = attributeOrbit(index);
+    const x = center.x + Math.cos(angle) * orbit;
+    const y = center.y + Math.sin(angle) * orbit * .7;
+    const start = attributePoint(center, { x, y });
+
+    part.connector.setAttribute("x1", start.x); part.connector.setAttribute("y1", start.y); part.connector.setAttribute("x2", x); part.connector.setAttribute("y2", y);
+    part.group.querySelector(".attribute-oval")?.setAttribute("cx", x); part.group.querySelector(".attribute-oval")?.setAttribute("cy", y);
+    part.group.querySelector(".attribute-oval-inner")?.setAttribute("cx", x); part.group.querySelector(".attribute-oval-inner")?.setAttribute("cy", y);
+    const label = part.group.querySelector(".attribute-label");
+    if (label) { label.setAttribute("x", x); label.setAttribute("y", y + 3); }
+    const underline = part.group.querySelector(".pk-underline");
+    if (underline) { underline.setAttribute("x1", x - Math.min(32, part.rx * .6)); underline.setAttribute("x2", x + Math.min(32, part.rx * .6)); underline.setAttribute("y1", y + 10); underline.setAttribute("y2", y + 10); }
+  });
+
+  entityParts.forEach((part) => {
+    const position = positions.get(part.entity.id);
+    if (position) part.group.setAttribute("transform", `translate(${position.x},${position.y})`);
+  });
 }
 
-function scheduleERSave() { clearTimeout(savingTimer); savingTimer = setTimeout(saveCurrentERState, 900); }
+function applyTransform(root) {
+  root.setAttribute("transform", `translate(${erLayout.translate[0]},${erLayout.translate[1]}) scale(${erLayout.zoom})`);
+}
 
-async function saveCurrentERState() {
-  if (!currentResult?.id) return;
-  try { await ensureCsrf(); await fetch(`/history/${currentResult.id}/state`, { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken }, body: JSON.stringify({ er_state: erState }) }); } catch (_) {}
+function beginEntityDrag(event, entity) {
+  if (event.button !== 0) return;
+  const pos = currentGeometry?.positions?.get(entity.id) || { x: 800, y: 500 };
+  dragState = { entityId: entity.id, startX: event.clientX, startY: event.clientY, baseX: pos.x, baseY: pos.y, moved: false };
+  window.addEventListener("pointermove", handleEntityDrag);
+  window.addEventListener("pointerup", endEntityDrag, { once: true });
+}
+
+function handleEntityDrag(event) {
+  if (!dragState || !currentGeometry) return;
+  const dx = event.clientX - dragState.startX;
+  const dy = event.clientY - dragState.startY;
+  if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragState.moved = true;
+  const scale = Math.max(.3, erLayout.zoom);
+  const x = dragState.baseX + dx / scale;
+  const y = dragState.baseY + dy / scale;
+  const live = currentGeometry.positions.get(dragState.entityId);
+  if (live) { live.x = x; live.y = y; }
+  persistPosition(dragState.entityId, x, y);
+  updateGeometry(currentGeometry);
+  updateSchemaMap([...currentGeometry.positions.keys()].map((id) => findEntityById(id)).filter(Boolean), currentGeometry.positions, currentGeometry.relationParts.map((p) => p.relation));
+}
+
+function endEntityDrag() {
+  window.removeEventListener("pointermove", handleEntityDrag);
+  if (dragState?.moved) scheduleLayoutSave();
+  dragState = null;
+}
+
+function beginPan(event) {
+  if (event.button !== 0 || dragState) return;
+  panState = { startX: event.clientX, startY: event.clientY, startTx: erLayout.translate[0], startTy: erLayout.translate[1] };
+  window.addEventListener("pointermove", handlePan);
+  window.addEventListener("pointerup", endPan, { once: true });
+}
+
+function handlePan(event) {
+  if (!panState) return;
+  erLayout.translate = [panState.startTx + event.clientX - panState.startX, panState.startTy + event.clientY - panState.startY];
+  const root = $("erGraph")?.querySelector(".er-root");
+  if (root) applyTransform(root);
+  if (currentGeometry) updateSchemaMap([...currentGeometry.positions.keys()].map((id) => findEntityById(id)).filter(Boolean), currentGeometry.positions, currentGeometry.relationParts.map((p) => p.relation));
+}
+
+function endPan() {
+  window.removeEventListener("pointermove", handlePan);
+  panState = null;
+  scheduleLayoutSave();
+}
+
+function persistPosition(id, x, y) {
+  const node = erLayout.nodes.find((item) => item.id === id);
+  if (node) { node.x = x; node.y = y; }
+  else erLayout.nodes.push({ id, x, y });
+}
+
+function initCanvasPointerHandlers() {
+  const svg = $("erGraph");
+  if (!svg) return;
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const direction = event.deltaY > 0 ? .9 : 1.1;
+    erLayout.zoom = Math.min(2.6, Math.max(.35, erLayout.zoom * direction));
+    const root = svg.querySelector(".er-root");
+    if (root) applyTransform(root);
+    scheduleLayoutSave();
+  }, { passive: false });
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.target === svg || event.target?.classList?.contains("er-root")) beginPan(event);
+  });
+}
+
+function clearSelectionStyles() {
+  document.querySelectorAll(".er-entity, .attribute-group, .relationship-group").forEach((el) => el.classList.remove("selected"));
+}
+
+function markSelection() {
+  if (!selectedElement) return;
+  if (selectedElement.type === "entity") {
+    document.querySelectorAll(".er-entity").forEach((el) => { if (el.dataset.entityId === selectedElement.id) el.classList.add("selected"); });
+  } else if (selectedElement.type === "attribute") {
+    document.querySelectorAll(".attribute-group").forEach((el) => { if (el.dataset.attributeId === selectedElement.id) el.classList.add("selected"); });
+  } else if (selectedElement.type === "relationship") {
+    document.querySelectorAll(".relationship-group").forEach((el) => { if (el.dataset.relId === selectedElement.id) el.classList.add("selected"); });
+  }
+}
+
+function centerOnEntity(entityId) {
+  const pos = currentGeometry?.positions?.get(entityId);
+  const svg = $("erGraph");
+  if (!pos || !svg) return;
+  erLayout.translate = [svg.clientWidth / 2 - pos.x * erLayout.zoom, svg.clientHeight / 2 - pos.y * erLayout.zoom];
+  const root = svg.querySelector(".er-root");
+  if (root) applyTransform(root);
+  scheduleLayoutSave();
+}
+
+function centerOnRelationship(relationId) {
+  const relation = erModel?.relationships?.find((r) => r.id === relationId);
+  if (!relation) return;
+  const a = currentGeometry?.positions?.get(relation.from);
+  const b = currentGeometry?.positions?.get(relation.to);
+  const svg = $("erGraph");
+  if (!a || !b || !svg) return;
+  const x = (a.x + b.x) / 2;
+  const y = (a.y + b.y) / 2;
+  erLayout.translate = [svg.clientWidth / 2 - x * erLayout.zoom, svg.clientHeight / 2 - y * erLayout.zoom];
+  const root = svg.querySelector(".er-root");
+  if (root) applyTransform(root);
+}
+
+function fitER() {
+  if (!erModel?.entities?.length || !currentGeometry) return;
+  const nodes = [...currentGeometry.positions.values()];
+  const minX = Math.min(...nodes.map((p) => p.x));
+  const maxX = Math.max(...nodes.map((p) => p.x));
+  const minY = Math.min(...nodes.map((p) => p.y));
+  const maxY = Math.max(...nodes.map((p) => p.y));
+  const svg = $("erGraph");
+  const width = svg?.clientWidth || 1000;
+  const height = svg?.clientHeight || 700;
+  const contentWidth = Math.max(700, maxX - minX + 550);
+  const contentHeight = Math.max(500, maxY - minY + 460);
+  erLayout.zoom = Math.min(1.25, Math.max(.45, Math.min(width / contentWidth, height / contentHeight)));
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  erLayout.translate = [width / 2 - centerX * erLayout.zoom, height / 2 - centerY * erLayout.zoom];
+  const root = svg.querySelector(".er-root");
+  if (root) applyTransform(root);
+  scheduleLayoutSave();
 }
 
 function resetERLayout() {
-  if (!currentResult?.parsed?.er) return;
-  stopERSimulation();
-  erState = defaultERState();
-  drawER(currentResult.parsed.er, erState);
-  scheduleERSave();
+  if (!erModel?.entities?.length) return;
+  erLayout = { version: 3, mode: erMode, nodes: defaultEntityPositions(erModel.entities), zoom: 1, translate: [0, 0] };
+  drawER();
+  fitER();
+  scheduleLayoutSave();
+}
+
+function updateSchemaMap(entities, positions, relationships = []) {
+  const svg = $("schemaMapSvg");
+  const count = $("schemaMapCount");
+  if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  // The minimap always represents the COMPLETE schema, even when the main
+  // canvas is in Query Focus. This makes it a real navigation map.
+  const allEntities = erModel?.entities || entities || [];
+  const allRelations = erModel?.relationships || relationships || [];
+  if (count) count.textContent = `${allEntities.length}`;
+  if (!allEntities.length) return;
+
+  const sourcePositions = positions && positions.size ? positions : new Map(
+    defaultEntityPositions(allEntities).map((node) => [node.id, { x: node.x, y: node.y }])
+  );
+  const raw = allEntities.map((entity) => sourcePositions.get(entity.id) || { x: 0, y: 0 });
+  const minX = Math.min(...raw.map((p) => p.x));
+  const maxX = Math.max(...raw.map((p) => p.x));
+  const minY = Math.min(...raw.map((p) => p.y));
+  const maxY = Math.max(...raw.map((p) => p.y));
+  const pad = 18;
+  const width = 240 - pad * 2;
+  const height = 150 - pad * 2;
+  const sx = Math.max(1, maxX - minX);
+  const sy = Math.max(1, maxY - minY);
+  const scale = Math.min(width / sx, height / sy);
+  const offsetX = pad + (width - sx * scale) / 2;
+  const offsetY = pad + (height - sy * scale) / 2;
+  const pts = new Map();
+
+  allEntities.forEach((entity) => {
+    const p = sourcePositions.get(entity.id) || { x: minX, y: minY };
+    pts.set(entity.id, {
+      x: offsetX + (p.x - minX) * scale,
+      y: offsetY + (p.y - minY) * scale
+    });
+  });
+
+  allRelations.forEach((relation) => {
+    const a = pts.get(relation.from);
+    const b = pts.get(relation.to);
+    if (!a || !b) return;
+    svg.appendChild(svgEl("line", {
+      x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+      class: `schema-map-line ${relation.query_relevant ? "hot" : ""}`
+    }));
+  });
+
+  allEntities.forEach((entity) => {
+    const p = pts.get(entity.id);
+    if (!p) return;
+    const group = svgEl("g", { class: "schema-map-item" });
+    const node = svgEl("rect", {
+      x: p.x - 18, y: p.y - 6, width: 36, height: 12, rx: 3,
+      class: `schema-map-node ${entity.query_relevant ? "hot" : ""}`
+    });
+    const label = svgText(group, entity.name.length > 7 ? `${entity.name.slice(0, 6)}…` : entity.name, {
+      x: p.x, y: p.y + 2.5, class: "schema-map-label", "text-anchor": "middle"
+    });
+    group.appendChild(node);
+    group.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setERMode("full");
+      focusEntity(entity.name, false);
+      centerOnEntity(entity.id);
+    });
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        setERMode("full");
+        focusEntity(entity.name, false);
+        centerOnEntity(entity.id);
+      }
+    });
+    group.setAttribute("tabindex", "0");
+    svg.appendChild(group);
+  });
+}
+
+function scheduleLayoutSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveCurrentLayout, 700);
+}
+
+async function saveCurrentLayout() {
+  if (!currentResult?.id) return;
+  try {
+    await ensureCsrf();
+    await fetch(`/history/${encodeURIComponent(currentResult.id)}/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({
+        session_id: currentResult.session_id || currentWorkspace?.id || null,
+        er_layout: erLayout
+      })
+    });
+  } catch (error) {
+    console.warn("Layout save failed", error);
+  }
+}
+
+async function loadCanonicalModel() {
+  setStatus("Refreshing schema…");
+  try {
+    const response = await fetch("/api/er-model");
+    const model = await response.json();
+    if (!response.ok) throw new Error(model.error || "Unable to load ER model");
+    erModel = model;
+    erLayout = mergeLayoutWithModel(erLayout, erModel);
+    schemaLoadedByAction = true;
+    renderInitialPanels();
+    drawER();
+    setStatus("Schema ready");
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Schema refresh failed");
+  }
 }
 
 async function loadHistory() {
-  const list = document.getElementById("historyList");
+  const target = $("panel-history");
+  if (!target) return;
+  const requestSequence = ++historyLoadSequence;
+  const requestedSessionId = currentWorkspace?.id || "";
+  target.innerHTML = `<div class="panel-heading"><div><div class="panel-kicker">SAVED WORK</div><h2>History</h2></div><button class="small secondary" onclick="loadHistory()">Refresh</button></div><div class="content-card"><p>Loading history…</p></div>`;
   try {
-    const response = await fetch("/history?limit=100");
+    const params = new URLSearchParams({ limit: "100" });
+    if (requestedSessionId) params.set("session_id", requestedSessionId);
+    const response = await fetch(`/history?${params.toString()}`);
     const items = await response.json();
+    // Ignore responses that finish after the user has switched to another session.
+    if (requestSequence !== historyLoadSequence || requestedSessionId !== (currentWorkspace?.id || "")) return;
     if (!response.ok) throw new Error(items.error || "Unable to load history");
-    if (!items.length) { list.innerHTML = `<div class="content-card"><p>No saved queries yet.</p></div>`; return; }
-    list.innerHTML = items.map(item => {
-      const firstLine = (item.query || "(empty query)").replace(/\s+/g, " ").trim();
-      const tables = item.parsed?.tables?.join(", ") || "No tables detected";
-      const issue = item.parsed?.validation_errors?.length ? "Needs review" : "Analyzed";
-      return `<div class="history-card">
-        <div class="history-top"><span class="badge">${escapeHtml(issue)}</span><span class="history-date">${escapeHtml(new Date(item.created_at || "").toLocaleString())}</span></div>
-        <div class="history-query">${escapeHtml(firstLine)}</div>
-        <div class="history-meta"><span>Tables: ${escapeHtml(tables)}</span><span>AI: ${escapeHtml(item.ai?.provider || "fallback")}</span></div>
-        <button class="secondary history-restore" onclick="restoreHistory('${escapeHtml(item.id)}')">Restore this state</button>
-      </div>`;
-    }).join("");
-  } catch (error) { list.innerHTML = `<div class="content-card error"><p>${escapeHtml(error.message)}</p></div>`; }
+    target.innerHTML = `<div class="panel-heading"><div><div class="panel-kicker">SAVED WORK</div><h2>History</h2></div><span class="badge">${items.length}</span></div>${items.length ? items.map(renderHistoryItem).join("") : `<div class="content-card"><p>No saved queries in this session yet.</p></div>`}`;
+  } catch (error) {
+    if (requestSequence !== historyLoadSequence) return;
+    target.innerHTML = `<div class="content-card error"><p>${esc(error.message)}</p></div>`;
+  }
 }
 
-async function restoreHistory(id) {
-  setStatus("Restoring…");
+function renderHistoryItem(item) {
+  const query = String(item.query || "").replace(/\s+/g, " ").trim();
+  const entities = item.er_model?.entities?.length || 0;
+  const relationships = item.er_model?.relationships?.length || 0;
+  const recovery = item.er_recovery_message ? `<div class="history-warning">${esc(item.er_recovery_message)}</div>` : "";
+  return `<article class="history-card"><div class="history-top"><span class="badge">${item.parsed?.validation_errors?.length ? "Needs review" : "Analyzed"}</span><span class="history-date">${esc(new Date(item.created_at || "").toLocaleString())}</span></div><div class="history-query" title="${esc(query)}">${esc(query || "(empty query)")}</div><div class="history-meta"><span>${entities} entities</span><span>${relationships} relationships</span></div>${recovery}<button class="secondary history-restore" onclick="restoreHistory('${esc(item.id)}', '${esc(item.session_id || currentWorkspace?.id || "")}')">Restore this state</button></article>`;
+}
+
+async function restoreHistory(id, sessionId = currentWorkspace?.id) {
+  setStatus("Restoring saved state…");
   try {
-    const response = await fetch(`/history/${id}`);
+    const params = new URLSearchParams();
+    if (sessionId) params.set("session_id", sessionId);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const response = await fetch(`/history/${encodeURIComponent(id)}${suffix}`);
     const item = await response.json();
     if (!response.ok) throw new Error(item.error || "Could not restore history");
-    currentResult = item;
-    document.getElementById("query").value = item.query || "";
-    erState = item.er_state || defaultERState();
-    renderAll(item);
-    activateTab("er");
-    setStatus("Historical state restored");
-  } catch (error) { setStatus(error.message); }
+    hydrateResult(item);
+    activatePanel("history");
+    setStatus(item.er_recovery_message || "Historical state restored");
+  } catch (error) {
+    setStatus(error.message || "Restore failed");
+  }
 }
 
-async function loadDatabaseSchema() {
-  const target = document.getElementById("databaseContent");
-  if (!target) return;
+function selectedContext() {
+  return selectedElement || null;
+}
+
+async function askAI(textOverride = null) {
+  if (aiRequestBusy) return;
+  const questionNode = $("aiQuestion");
+  const question = String(textOverride ?? questionNode?.value ?? "").trim();
+  if (!question) {
+    setStatus("Write a question for the AI Tutor");
+    activatePanel("ai");
+    return;
+  }
+  if (!erModel) {
+    setStatus("The ER model is still loading");
+    return;
+  }
+
+  aiRequestBusy = true;
+  const button = $("aiAskButton");
+  if (button) button.disabled = true;
+  const answerNode = $("aiAnswer");
+  if (answerNode) answerNode.innerHTML = `<div class="ai-item">Thinking with the ER model…</div>`;
+  activatePanel("ai");
+
   try {
-    const response = await fetch("/api/database/schema");
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Unable to load database schema");
-    target.innerHTML = data.map(table => `<div class="schema-card"><div class="schema-heading"><div><h3>${escapeHtml(table.name)}</h3><span>${escapeHtml(table.rows)} row(s)</span></div></div><div class="schema-columns">${table.columns.map(column => `<div class="schema-column"><strong>${escapeHtml(column.name)}</strong><span>${escapeHtml(column.type || "TEXT")}${column.primary_key ? " · PK" : ""}</span></div>`).join("")}</div></div>`).join("");
-  } catch (error) { target.innerHTML = `<div class="content-card error"><p>${escapeHtml(error.message)}</p></div>`; }
+    await ensureCsrf();
+    const response = await fetch("/api/ai/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({
+        question,
+        selected: selectedContext(),
+        query: currentResult?.query || $("query")?.value || "",
+        parsed: currentResult?.parsed || {},
+        er_model: erModel
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "AI request failed");
+    if (answerNode) answerNode.innerHTML = `<div class="ai-item ai-answer"><strong>${esc(result.provider || "AI Tutor")}</strong><br>${esc(result.answer || "No answer returned.")}</div>`;
+    applyAIHighlight(result.highlight || {});
+    const suggestions = $("aiSuggestions");
+    if (suggestions) suggestions.innerHTML = (result.suggestions || []).map((s) => `<button class="ai-chip" onclick="askAI('${esc(s)}')">${esc(s)}</button>`).join("");
+    if (questionNode && !textOverride) questionNode.value = "";
+    setStatus("AI Tutor answered");
+  } catch (error) {
+    if (answerNode) answerNode.innerHTML = `<div class="ai-item warn-item">${esc(error.message || "AI request failed")}</div>`;
+    setStatus(error.message || "AI request failed");
+  } finally {
+    aiRequestBusy = false;
+    if (button) button.disabled = false;
+  }
 }
 
-loadHistory();
-loadDatabaseSchema();
+function applyAIHighlight(highlight) {
+  clearSelectionStyles();
+  const entityIds = new Set(highlight.entities || []);
+  const relationIds = new Set(highlight.relationships || []);
+  const attributeIds = new Set(highlight.attributes || []);
+  document.querySelectorAll(".er-entity").forEach((el) => { if (entityIds.has(el.dataset.entityId)) el.classList.add("selected"); });
+  document.querySelectorAll(".relationship-group").forEach((el) => { if (relationIds.has(el.dataset.relId)) el.classList.add("selected"); });
+  document.querySelectorAll(".attribute-group").forEach((el) => { if (attributeIds.has(el.dataset.attributeId)) el.classList.add("selected"); });
+}
+
+function showERToast(message) {
+  const toast = $("erToast");
+  if (!toast) return;
+  toast.hidden = false;
+  toast.textContent = message;
+}
+
+function hideERToast() {
+  const toast = $("erToast");
+  if (toast) toast.hidden = true;
+}
+
+function initResize() {
+  const divider = $("workspaceDivider");
+  const side = $("learningSide");
+  const workspace = $("workspace");
+  if (!divider || !side || !workspace) return;
+  divider.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    resizeState = { startX: event.clientX, startWidth: side.getBoundingClientRect().width };
+    document.body.classList.add("resizing");
+    window.addEventListener("pointermove", resizeMove);
+    window.addEventListener("pointerup", resizeEnd, { once: true });
+  });
+  function resizeMove(event) {
+    if (!resizeState) return;
+    const total = workspace.getBoundingClientRect().width;
+    const width = Math.min(total * .62, Math.max(330, resizeState.startWidth - (event.clientX - resizeState.startX)));
+    workspace.style.setProperty("--learning-width", `${width}px`);
+  }
+  function resizeEnd() {
+    resizeState = null;
+    document.body.classList.remove("resizing");
+    window.removeEventListener("pointermove", resizeMove);
+  }
+}
+
+function activateLearningSection(section) {
+  const actions = {
+    schema: () => { setERMode("full"); fitER(); },
+    query: () => { $("query")?.focus(); },
+    explain: () => { activatePanel("analysis"); },
+    practice: () => { activatePanel("ai"); $("aiQuestion")?.focus(); }
+  };
+  actions[section]?.();
+}
+
+async function clearDatabase() {
+  const confirmed = window.confirm(
+    "Delete every row from your personal SQL sandbox?\n\n" +
+    "The table structure, columns, primary keys and relationships will remain.\n\n" +
+    "This cannot be undone."
+  );
+  if (!confirmed) return;
+
+  setStatus("Deleting sandbox data…");
+  try {
+    await ensureCsrf();
+    const response = await fetch("/api/database/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken }
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Unable to clear database");
+
+    currentResult = null;
+    erModel = null;
+    selectedElement = null;
+    schemaLoadedByAction = false;
+    erLayout = { version: 3, mode: erMode, nodes: [], zoom: 1, translate: [0, 0] };
+    renderInitialPanels();
+    clearERCanvas("This session is empty. Enter a SQL query to begin.");
+    await loadHistory();
+    currentWorkspace = result.workspace || currentWorkspace;
+    if (currentWorkspace) {
+      workspaces = workspaces.map((item) => item.id === currentWorkspace.id ? currentWorkspace : item);
+      applyWorkspace(currentWorkspace);
+    }
+    setStatus(`Session cleared · ${result.total_rows} row(s) deleted`);
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Database clear failed");
+  }
+}
+
+async function boot() {
+  renderInitialPanels();
+  initResize();
+  initCanvasPointerHandlers();
+  clearERCanvas();
+  try {
+    await loadWorkspaces();
+    await loadHistory();
+    setStatus("Ready · enter a SQL query to begin");
+  } catch (error) {
+    console.error("Boot failed", error);
+    setStatus(error.message || "Workspace initialization failed");
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const queryNode = $("query");
+  queryNode?.addEventListener("input", () => {
+    if (queryNode.value.trim()) return;
+    currentResult = null;
+    erModel = null;
+    selectedElement = null;
+    schemaLoadedByAction = false;
+    erLayout = { version: 3, mode: erMode, nodes: [], zoom: 1, translate: [0, 0] };
+    renderInitialPanels();
+    clearERCanvas();
+  });
+  boot();
+});

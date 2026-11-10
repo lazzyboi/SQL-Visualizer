@@ -3,96 +3,158 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SQL Visualizer</title>
+  <title>SQL Visualizer · ER Learning Lab</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <div class="app-shell">
   <header class="topbar">
-    <div>
-      <div class="eyebrow">SQL LEARNING PLATFORM</div>
+    <div class="brand-block">
+      <div class="eyebrow">SQL LEARNING PLATFORM · ER LAB</div>
       <h1>SQL Visualizer</h1>
-      <p>Analyze, visualize, run and understand SQL.</p>
+      <p>Learn SQL by connecting the query, the real schema, and the ER diagram.</p>
     </div>
-    <div class="account-area">
-      <div class="account-chip"><span class="account-label">Signed in as</span><strong>{{ user.email }}</strong></div>
-      {% if is_admin %}<a class="logout-link" href="/admin">Admin DB</a>{% endif %}
-      <a class="logout-link" href="/logout">Log out</a>
-      <div class="status" id="status">Ready</div>
+    <div class="header-actions">
+      <div class="session-switcher" id="sessionSwitcher">
+        <div class="session-label">SQL SESSIONS</div>
+        <div class="session-controls">
+          <button class="session-trigger" id="sessionTrigger" onclick="toggleSessionMenu()" aria-expanded="false" aria-controls="sessionMenu">
+            <span class="session-trigger-copy">
+              <strong id="sessionName">{{ workspace.name if workspace else 'My Workspace' }}</strong>
+              <small>Separate database · queries · ER layout · AI context</small>
+            </span>
+            <span class="session-chevron">⌄</span>
+          </button>
+          <button class="small session-new-button" onclick="createWorkspace()" title="Create a new independent SQL session">+ New Session</button>
+        </div>
+        <div class="session-menu" id="sessionMenu" hidden>
+          <div class="session-menu-head">
+            <div><span class="panel-kicker">YOUR SESSIONS</span><strong>Each session stays separate</strong></div>
+            <button class="small" onclick="createWorkspace()">+ New Session</button>
+          </div>
+          <div id="sessionList" class="session-list"></div>
+        </div>
+      </div>
+
+      <div class="account-area">
+        <div class="account-chip">
+          <span class="account-label">Signed in as</span>
+          <strong>{{ user.email }}</strong>
+        </div>
+        {% if is_admin %}<a class="top-link" href="/admin">Admin DB</a>{% endif %}
+        <a class="top-link" href="/logout">Log out</a>
+        <div class="status" id="status">Ready · enter a SQL query to begin</div>
+      </div>
     </div>
   </header>
 
-  <main>
-    <section class="editor-card card">
-      <div class="section-heading">
+  <section class="editor-card card">
+    <div class="section-heading">
+      <div>
+        <div class="panel-kicker">SQL EDITOR</div>
+        <h2>Write a query, then explore it visually</h2>
+        <span>SELECT/WITH queries execute read-only against the active session sandbox.</span>
+      </div>
+      <div class="actions">
+        <button id="analyzeButton" onclick="runAnalysis()">Analyze Query</button>
+        <button class="danger" onclick="clearDatabase()" title="Delete all rows from this session; keep its schema">Delete Everything</button>
+        <button class="secondary" onclick="loadCanonicalModel()">Refresh Schema</button>
+      </div>
+    </div>
+    <textarea id="query" spellcheck="false" placeholder="SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 50;"></textarea>
+    <div class="editor-note">
+      <span id="workspaceBadge">Active session</span>
+      <span>Each session has its own data, history, ER layout, and AI context.</span>
+    </div>
+  </section>
+
+  <section class="learning-path card" aria-label="Guided learning sections">
+    <div class="learning-path-title">
+      <div class="panel-kicker">GUIDED FLOW</div>
+      <strong>Learn SQL in four sections</strong>
+      <span>Start with the schema, then query, understand, and practice.</span>
+    </div>
+    <button class="path-step" onclick="activateLearningSection('schema')"><b>01</b><span>Schema</span><small>Know the tables</small></button>
+    <button class="path-step" onclick="activateLearningSection('query')"><b>02</b><span>Query</span><small>Write SQL</small></button>
+    <button class="path-step" onclick="activateLearningSection('explain')"><b>03</b><span>Explain</span><small>Read the result</small></button>
+    <button class="path-step" onclick="activateLearningSection('practice')"><b>04</b><span>Practice</span><small>Ask the tutor</small></button>
+  </section>
+
+  <main class="workspace card" id="workspace">
+    <section class="diagram-side">
+      <div class="diagram-header">
         <div>
-          <h2>SQL Editor</h2>
-          <span>Analyze one SELECT/WITH query at a time against your personal read-only sandbox.</span>
+          <div class="panel-kicker">CONCEPTUAL MODEL</div>
+          <h2>Entity Relationship Diagram</h2>
+          <p id="erSubtitle">Waiting for SQL input…</p>
         </div>
-        <div class="actions">
-          <button id="analyzeButton" onclick="runAnalysis()">Analyze Query</button>
-          <button class="secondary" onclick="loadHistory()">Refresh History</button>
+        <div class="diagram-actions">
+          <div class="segmented" aria-label="ER mode">
+            <button class="seg active" id="modeFull" onclick="setERMode('full')">Full Schema</button>
+            <button class="seg" id="modeFocus" onclick="setERMode('focus')">Query Focus</button>
+          </div>
+          <button class="small secondary" onclick="fitER()">Fit</button>
+          <button class="small secondary" onclick="resetERLayout()">Reset</button>
         </div>
       </div>
-      <textarea id="query" spellcheck="false" placeholder="SELECT users.id, users.name FROM users JOIN orders ON users.id = orders.user_id WHERE users.id = 1;"></textarea>
-      <div class="editor-note"><span>Personal sandbox</span><span>Sample tables: users · orders · products · order_items · departments</span></div>
-    </section>
 
-    <nav class="tabs" aria-label="Application sections">
-      <button class="tab active" data-tab="er">ER Diagram</button>
-      <button class="tab" data-tab="analysis">Analysis</button>
-      <button class="tab" data-tab="performance">Performance</button>
-      <button class="tab" data-tab="security">Security</button>
-      <button class="tab" data-tab="output">Output</button>
-      <button class="tab" data-tab="ai">AI Tutor</button>
-      <button class="tab" data-tab="database">Database</button>
-      <button class="tab" data-tab="history">History</button>
-    </nav>
-
-    <section class="tab-panel active" id="tab-er">
-      <div class="panel-toolbar">
-        <div><h2>Entity Relationship Diagram</h2><p>Drag tables to reposition them. Layout and zoom are saved with the history entry.</p></div>
-        <button class="secondary" onclick="resetERLayout()">Reset Layout</button>
+      <div class="diagram-tools">
+        <label class="search-box">
+          <span>⌕</span>
+          <input id="erSearch" type="search" placeholder="Search entity or attribute…" oninput="applyERFilters()">
+        </label>
+        <label class="toggle"><input type="checkbox" id="keyFilter" onchange="applyERFilters()"><span>PK / FK only</span></label>
+        <label class="toggle"><input type="checkbox" id="attributeFilter" checked onchange="applyERFilters()"><span>Attributes</span></label>
+        <label class="toggle"><input type="checkbox" id="relationshipFilter" checked onchange="applyERFilters()"><span>Relationships</span></label>
+        <span class="notation-legend">
+          <span><i class="legend-entity"></i>Entity</span>
+          <span><i class="legend-attribute"></i>Attribute</span>
+          <span><i class="legend-relationship"></i>Relationship</span>
+        </span>
       </div>
-      <div class="er-wrap">
-        <svg id="erGraph" viewBox="0 0 1200 700" role="img" aria-label="SQL entity relationship diagram"></svg>
-        <div class="empty-state" id="erEmpty">Run a query containing one or more tables to generate the diagram.</div>
-      </div>
-    </section>
 
-    <section class="tab-panel" id="tab-analysis"><div id="analysisContent" class="content-grid"></div></section>
-
-    <section class="tab-panel" id="tab-performance">
-      <div class="metric-card">
-        <div><span class="metric-label">Plan status</span><strong id="performanceStatus">—</strong></div>
-        <div><span class="metric-label">Plan steps</span><strong id="performanceSteps">—</strong></div>
-      </div>
-      <div id="performanceContent" class="content-grid"></div>
-    </section>
-
-    <section class="tab-panel" id="tab-security"><div id="securityContent"></div></section>
-    <section class="tab-panel" id="tab-output"><div id="outputContent"></div></section>
-
-    <section class="tab-panel" id="tab-ai">
-      <div class="ai-layout">
-        <div class="ai-panel"><div class="panel-kicker">AI TUTOR</div><h2 id="aiTitle">Waiting for a query</h2><div id="aiSummary"></div></div>
-        <div class="ai-panel"><div class="panel-kicker">LEARN</div><div id="aiTeaching"></div></div>
-        <div class="ai-panel"><div class="panel-kicker">IMPROVE</div><div id="aiSuggestions"></div></div>
+      <div class="canvas-wrap" id="canvasWrap">
+        <svg id="erGraph" viewBox="0 0 1600 1000" role="img" aria-label="Conceptual entity relationship diagram"></svg>
+        <div id="erEmpty" class="empty-state">
+          <div class="empty-symbol">◇</div>
+          <h3>Nothing to visualize yet</h3>
+          <p>Enter a SQL query and press Analyze Query to build the ER diagram.</p>
+        </div>
+        <div id="erToast" class="er-toast" hidden></div>
+        <div class="schema-map" id="schemaMap">
+          <div class="schema-map-head">
+            <span>Schema Map</span>
+            <strong id="schemaMapCount">0</strong>
+          </div>
+          <svg id="schemaMapSvg" viewBox="0 0 240 150" aria-label="Schema overview map"></svg>
+        </div>
+        <div class="canvas-hint">Drag entities · Wheel to zoom · Drag empty space to pan · Click an element to teach it</div>
       </div>
     </section>
 
-    <section class="tab-panel" id="tab-database">
-      <div class="panel-toolbar"><div><h2>Personal Database</h2><p>This sandbox belongs to your account. Queries run read-only against it.</p></div><button class="secondary" onclick="loadDatabaseSchema()">Refresh Schema</button></div>
-      <div id="databaseContent" class="schema-grid"></div>
-    </section>
+    <div class="workspace-divider" id="workspaceDivider" role="separator" aria-label="Resize learning panel"></div>
 
-    <section class="tab-panel" id="tab-history">
-      <div class="panel-toolbar"><div><h2>History</h2><p>Restore a previous query together with its AI analysis, output, and ER diagram state.</p></div></div>
-      <div id="historyList" class="history-list"></div>
-    </section>
+    <aside class="learning-side" id="learningSide">
+      <nav class="learning-tabs" aria-label="Learning panels">
+        <button class="learning-tab active" data-panel="analysis" onclick="activatePanel('analysis')">Analysis</button>
+        <button class="learning-tab" data-panel="cost" onclick="activatePanel('cost')">Cost</button>
+        <button class="learning-tab" data-panel="security" onclick="activatePanel('security')">Security</button>
+        <button class="learning-tab" data-panel="output" onclick="activatePanel('output')">Output</button>
+        <button class="learning-tab" data-panel="ai" onclick="activatePanel('ai')">AI Tutor</button>
+        <button class="learning-tab" data-panel="history" onclick="activatePanel('history')">History</button>
+      </nav>
+
+      <div class="panel-scroll">
+        <section id="panel-analysis" class="learning-panel active"></section>
+        <section id="panel-cost" class="learning-panel"></section>
+        <section id="panel-security" class="learning-panel"></section>
+        <section id="panel-output" class="learning-panel"></section>
+        <section id="panel-ai" class="learning-panel"></section>
+        <section id="panel-history" class="learning-panel"></section>
+      </div>
+    </aside>
   </main>
 </div>
-<script src="https://d3js.org/d3.v7.min.js"></script>
 <script src="/static/script.js"></script>
 </body>
 </html>

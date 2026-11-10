@@ -218,6 +218,7 @@ def authenticate_user(email: str, password: str) -> dict[str, Any] | None:
 
 
 def get_user_db_path(user_id: str) -> str:
+    """Return the legacy per-user sandbox path kept for compatibility."""
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", user_id)
     if not safe_id:
         raise ValueError("Invalid user id")
@@ -226,8 +227,21 @@ def get_user_db_path(user_id: str) -> str:
     return os.path.join(user_dir, "sandbox.db")
 
 
-def seed_user_database(user_id: str) -> None:
-    path = get_user_db_path(user_id)
+def get_session_db_path(user_id: str, session_id: str) -> str:
+    """Return the isolated SQLite file for one learning workspace/session."""
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "", str(user_id))
+    safe_session = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id))
+    if not safe_user or not safe_session:
+        raise ValueError("Invalid workspace identifier")
+    session_dir = os.path.join(USERS_DIR, safe_user, "sessions", safe_session)
+    os.makedirs(session_dir, exist_ok=True)
+    return os.path.join(session_dir, "sandbox.db")
+
+
+def initialize_session_database(path: str, seed_demo: bool = True) -> None:
+    """Create one isolated SQL sandbox, optionally with the standard demo rows."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new_database = not os.path.exists(path) or os.path.getsize(path) == 0
     with sqlite3.connect(path) as conn:
         conn.executescript(
             """
@@ -268,48 +282,109 @@ def seed_user_database(user_id: str) -> None:
                 FOREIGN KEY (order_id) REFERENCES orders(id),
                 FOREIGN KEY (product_id) REFERENCES products(id)
             );
-
-            INSERT OR IGNORE INTO departments (id, name) VALUES
-                (1, 'Computer Science'),
-                (2, 'Engineering'),
-                (3, 'Management');
-
-            INSERT OR IGNORE INTO users (id, name, email, department_id) VALUES
-                (1, 'Alice', 'alice@example.com', 1),
-                (2, 'Rahul', 'rahul@example.com', 2),
-                (3, 'Priya', 'priya@example.com', 1),
-                (4, 'David', 'david@example.com', 3);
-
-            INSERT OR IGNORE INTO products (id, name, price) VALUES
-                (1, 'Keyboard', 45.00),
-                (2, 'Mouse', 25.00),
-                (3, 'Monitor', 210.00),
-                (4, 'Headset', 80.00);
-
-            INSERT OR IGNORE INTO orders (id, user_id, amount, status) VALUES
-                (101, 1, 70.00, 'PAID'),
-                (102, 1, 210.00, 'SHIPPED'),
-                (103, 2, 105.00, 'PAID'),
-                (104, 3, 290.00, 'PROCESSING'),
-                (105, 4, 80.00, 'PAID');
-
-            INSERT OR IGNORE INTO order_items (id, order_id, product_id, quantity) VALUES
-                (1, 101, 1, 1),
-                (2, 101, 2, 1),
-                (3, 102, 3, 1),
-                (4, 103, 1, 1),
-                (5, 103, 2, 1),
-                (6, 104, 3, 1),
-                (7, 104, 4, 1),
-                (8, 105, 4, 1);
             """
         )
+
+        if seed_demo and is_new_database:
+            conn.executescript(
+                """
+                INSERT OR IGNORE INTO departments (id, name) VALUES
+                    (1, 'Computer Science'),
+                    (2, 'Engineering'),
+                    (3, 'Management');
+
+                INSERT OR IGNORE INTO users (id, name, email, department_id) VALUES
+                    (1, 'Alice', 'alice@example.com', 1),
+                    (2, 'Rahul', 'rahul@example.com', 2),
+                    (3, 'Priya', 'priya@example.com', 1),
+                    (4, 'David', 'david@example.com', 3);
+
+                INSERT OR IGNORE INTO products (id, name, price) VALUES
+                    (1, 'Keyboard', 45.00),
+                    (2, 'Mouse', 25.00),
+                    (3, 'Monitor', 210.00),
+                    (4, 'Headset', 80.00);
+
+                INSERT OR IGNORE INTO orders (id, user_id, amount, status) VALUES
+                    (101, 1, 70.00, 'PAID'),
+                    (102, 1, 210.00, 'SHIPPED'),
+                    (103, 2, 105.00, 'PAID'),
+                    (104, 3, 290.00, 'PROCESSING'),
+                    (105, 4, 80.00, 'PAID');
+
+                INSERT OR IGNORE INTO order_items (id, order_id, product_id, quantity) VALUES
+                    (1, 101, 1, 1),
+                    (2, 101, 2, 1),
+                    (3, 102, 3, 1),
+                    (4, 103, 1, 1),
+                    (5, 103, 2, 1),
+                    (6, 104, 3, 1),
+                    (7, 104, 4, 1),
+                    (8, 105, 4, 1);
+                """
+            )
         conn.commit()
 
 
-def database_schema(user_id: str) -> list[dict[str, Any]]:
+def seed_user_database(user_id: str) -> None:
+    """Keep the old API working for admin/local compatibility."""
+    initialize_session_database(get_user_db_path(user_id), seed_demo=True)
+
+
+def seed_session_database(user_id: str, session_id: str, seed_demo: bool = True) -> str:
+    path = get_session_db_path(user_id, session_id)
+    initialize_session_database(path, seed_demo=seed_demo)
+    return path
+
+
+def clear_session_database_data(user_id: str, session_id: str) -> dict[str, int]:
+    """Delete all rows from one workspace while preserving its schema."""
+    path = get_session_db_path(user_id, session_id)
+    initialize_session_database(path, seed_demo=False)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        deleted: dict[str, int] = {}
+        for table in tables:
+            safe_table = table.replace('"', '""')
+            before = conn.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+            conn.execute(f'DELETE FROM "{safe_table}"')
+            deleted[table] = int(before)
+        conn.commit()
+    return deleted
+
+
+def clear_user_database_data(user_id: str) -> dict[str, int]:
+    """Delete all rows from the legacy per-user sandbox."""
     path = get_user_db_path(user_id)
-    seed_user_database(user_id)
+    initialize_session_database(path, seed_demo=True)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        deleted: dict[str, int] = {}
+        for table in tables:
+            safe_table = table.replace('"', '""')
+            before = conn.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+            conn.execute(f'DELETE FROM "{safe_table}"')
+            deleted[table] = int(before)
+        conn.commit()
+    return deleted
+
+
+def _database_schema_for_path(path: str) -> list[dict[str, Any]]:
+    initialize_session_database(path, seed_demo=False)
     with sqlite3.connect(path) as conn:
         tables = [
             row[0]
@@ -339,6 +414,14 @@ def database_schema(user_id: str) -> list[dict[str, Any]]:
             )
         return result
 
+
+def database_schema(user_id: str) -> list[dict[str, Any]]:
+    """Legacy schema helper."""
+    return _database_schema_for_path(get_user_db_path(user_id))
+
+
+def database_schema_for_session(user_id: str, session_id: str) -> list[dict[str, Any]]:
+    return _database_schema_for_path(get_session_db_path(user_id, session_id))
 
 def admin_list_users(limit: int = 100) -> list[dict[str, Any]]:
     collection = _mongo_collection()
